@@ -1,0 +1,35 @@
+# Pre: the offline peer is running again. Post: the pending update was delivered and cleared.
+# Engine retries on its own backoff; the page only reads Engine state and never resends.
+appId: ${APP_ID}
+---
+- runFlow: ../actions/devices/open.yaml
+- runFlow:
+    file: ../actions/devices/open-device.yaml
+    env:
+      DEVICE: ${OFFLINE}
+- scrollUntilVisible:
+    element:
+      text: "Version"
+    direction: DOWN
+    timeout: 20000
+- extendedWaitUntil:
+    notVisible: "Not yet delivered"
+    timeout: 280000
+# A system paste prompt hides the page and would satisfy the wait above; dismiss and wait again.
+- runFlow: ../actions/system/dismiss-paste-prompt.yaml
+- extendedWaitUntil:
+    notVisible: "Not yet delivered"
+    timeout: 280000
+- runFlow: ../actions/system/dismiss-paste-prompt.yaml
+# Positive check first: the sheet content is really in the hierarchy, not hidden by a prompt.
+- assertVisible: "Device identity"
+- assertVisible: "Version"
+- assertNotVisible: "Not yet delivered"
+- assertNotVisible: "Security update"
+- takeScreenshot: group-update-delivered-detail
+- runFlow: ../actions/devices/close-device.yaml
+- runFlow: ../actions/system/dismiss-paste-prompt.yaml
+- assertVisible: ${OFFLINE}
+- assertNotVisible: "Security update not yet delivered.*"
+- takeScreenshot: group-update-delivered-list
+- runFlow: ../actions/navigation/open-clipboard-tab.yaml

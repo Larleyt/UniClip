@@ -12,11 +12,22 @@ import {
   TextButton,
   useMaterialColors,
 } from '@expo/ui/jetpack-compose';
-import { fillMaxWidth, height, padding, width } from '@expo/ui/jetpack-compose/modifiers';
+import {
+  fillMaxWidth,
+  height,
+  padding,
+  verticalScroll,
+  width,
+} from '@expo/ui/jetpack-compose/modifiers';
 import { useTranslation } from 'react-i18next';
 
 import { useTheme } from '@/hooks/useTheme';
-import type { DeviceTrustDeviceView } from '@/features/space';
+import {
+  deviceGroupUpdateGuidance,
+  deviceGroupUpdateRows,
+  type DeviceTrustDeviceView,
+} from '@/features/space';
+import type { DeviceGroupUpdate } from '@/platform/engine';
 import type { SpaceDeviceDetailProps } from './SpaceDeviceDetail.types';
 import { MATERIAL_SEED_COLOR } from '@/theme/colors';
 
@@ -34,6 +45,38 @@ function factValue(
   return device[fact];
 }
 
+// Engine's pending group key update for this device: state rows, then recovery guidance.
+function GroupUpdateRows({ update }: { update: DeviceGroupUpdate }) {
+  const { t } = useTranslation('settingsSync');
+  const colors = useMaterialColors();
+  return (
+    <>
+      {deviceGroupUpdateRows(update, t).map((row) => (
+        <ListItem key={`groupUpdate-${row.key}`}>
+          <ListItem.HeadlineContent>
+            <ComposeText>{row.label}</ComposeText>
+          </ListItem.HeadlineContent>
+          <ListItem.TrailingContent>
+            <ComposeText color={colors.onSurfaceVariant}>{row.value}</ComposeText>
+          </ListItem.TrailingContent>
+        </ListItem>
+      ))}
+      <ListItem>
+        <ListItem.LeadingContent>
+          <Icon
+            source={ICONS.info}
+            size={20}
+            tint={update.recovery === 'reviewDevice' ? colors.error : colors.primary}
+          />
+        </ListItem.LeadingContent>
+        <ListItem.HeadlineContent>
+          <ComposeText>{t(deviceGroupUpdateGuidance(update))}</ComposeText>
+        </ListItem.HeadlineContent>
+      </ListItem>
+    </>
+  );
+}
+
 function DeviceDetailContent(props: SpaceDeviceDetailProps) {
   const { t } = useTranslation('settingsSync');
   const colors = useMaterialColors();
@@ -46,7 +89,8 @@ function DeviceDetailContent(props: SpaceDeviceDetailProps) {
         onDismissRequest={props.removing ? () => undefined : props.onClose}
         initialFullyExpanded
       >
-        <Column modifiers={[fillMaxWidth(), padding(12, 0, 12, 24)]}>
+        {/* The device facts, delivery state and actions can exceed a short screen. */}
+        <Column modifiers={[fillMaxWidth(), padding(12, 0, 12, 24), verticalScroll()]}>
           <ListItem>
             <ListItem.LeadingContent>
               <Icon source={ICONS.device} size={36} tint={colors.primary} />
@@ -84,6 +128,8 @@ function DeviceDetailContent(props: SpaceDeviceDetailProps) {
               </ListItem.TrailingContent>
             </ListItem>
           ))}
+
+          {device.groupUpdate ? <GroupUpdateRows update={device.groupUpdate} /> : null}
 
           {device.blockedReason !== null ? (
             <ListItem>

@@ -1,0 +1,23 @@
+# Pre: a top-level destination is visible. Post: home ready.
+appId: ${APP_ID}
+---
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - tapOn:
+          id: main-tab-Clipboard
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - retry:
+          maxRetries: 3
+          commands:
+            - runFlow: ../system/dismiss-paste-prompt.yaml
+            - tapOn: "Clipboard"
+            - extendedWaitUntil:
+                visible:
+                  id: "home-menu|history-search-open"
+                timeout: 10000
+- runFlow: ../../assertions/home-ready.yaml
