@@ -22,7 +22,12 @@ const withForegroundService: ConfigPlugin = (config) => {
     };
 
     addPermission('android.permission.FOREGROUND_SERVICE');
-    addPermission('android.permission.FOREGROUND_SERVICE_DATA_SYNC');
+    // The service keeps a live peer-to-peer link to the user's own devices over the local network
+    // (mDNS discovery plus direct connections), which is what connectedDevice describes. dataSync
+    // would impose a 6 h/24 h budget on Android 15+ and cannot be started from BOOT_COMPLETED.
+    addPermission('android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE');
+    // Required by the foreground service type, and by the multicast lock mDNS discovery needs.
+    addPermission('android.permission.CHANGE_WIFI_MULTICAST_STATE');
 
     // Register Service in <application>
     const application = manifest.application?.[0];
@@ -31,17 +36,19 @@ const withForegroundService: ConfigPlugin = (config) => {
         application.service = [];
       }
       const serviceClassName = 'expo.modules.foregroundservice.SyncForegroundService';
-      if (
-        !application.service.some(
-          (s: { $?: { 'android:name'?: string } }) => s.$?.['android:name'] === serviceClassName
-        )
-      ) {
+      const existing = application.service.find(
+        (s: { $?: { 'android:name'?: string } }) => s.$?.['android:name'] === serviceClassName
+      );
+      if (existing?.$) {
+        // An entry kept from an earlier prebuild must not keep a type the service no longer starts with.
+        existing.$['android:foregroundServiceType'] = 'connectedDevice';
+      } else if (!existing) {
         application.service.push({
           $: {
             'android:name': serviceClassName,
             'android:enabled': 'true',
             'android:exported': 'false',
-            'android:foregroundServiceType': 'dataSync',
+            'android:foregroundServiceType': 'connectedDevice',
           },
         });
         console.log(`✅ Registered service: ${serviceClassName}`);

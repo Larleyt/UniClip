@@ -341,6 +341,285 @@ internal fun clipDataForSnapshot(
   return clipDataForRepresentation(context, files, first, displayNames)
 }
 
+/**
+ * Process-wide owner of the single Rust Engine.
+ *
+ * The Engine used to live inside the JS module instance, so destroying the React runtime (task
+ * removal, activity teardown, bridge reload) shut it down even while the background service was
+ * meant to keep syncing. The owner outlives any JS runtime: the module attaches to it, the service
+ * retains it, and the Engine only shuts down once neither holds it (or when asked explicitly).
+ * All state transitions are serialized by [lock].
+ */
+object EngineOwner {
+  /**
+   * Every state transition (start, shutdown, retain/release, lifecycle policy) runs under this
+   * lock, so a service release can never interleave with a JS start or a shutdown. [lock] only
+   * guards the fields for readers that are not transitions.
+   */
+  private val transitions = java.util.concurrent.locks.ReentrantLock()
+  private val lock = Any()
+  private val lifecycle = NativeLifecycleHost { error ->
+    Log.e("UcEngine", "P2P engine lifecycle transition failed", error)
+  }
+  private var logInstallation: BindingObservabilitySetup? = null
+  private var engine: MobileEngine? = null
+  private var startupLifecycle: MobileStartupLifecycle? = null
+  private var files: FileHandleRegistry? = null
+  private var analytics: AndroidPostHogAnalyticsHost? = null
+  private var retainers = 0
+
+  internal fun engine(): MobileEngine? = synchronized(lock) { engine }
+  internal fun files(): FileHandleRegistry? = synchronized(lock) { files }
+  internal fun logInstallation(): BindingObservabilitySetup? = synchronized(lock) { logInstallation }
+  internal fun setLogInstallation(setup: BindingObservabilitySetup) = synchronized(lock) { logInstallation = setup }
+
+  /** True while an Engine (or one that is starting) exists in this process. */
+  fun isActive(): Boolean = synchronized(lock) { engine != null || startupLifecycle != null }
+
+  /** Number of native holders (background service) keeping the Engine alive. */
+  fun retainerCount(): Int = synchronized(lock) { retainers }
+
+  private fun reportLifecycleError(error: Throwable) {
+    Log.e("UcEngine", "P2P engine lifecycle transition failed", error)
+  }
+
+  private fun currentLifecycle(context: Context): EngineLifecycle? = synchronized(lock) {
+    engine?.let { AndroidEngineLifecycle(it, AndroidNativeDiagnostics.get(context)) }
+      ?: startupLifecycle?.let(::AndroidStartupLifecycle)
+  }
+
+  internal fun analyticsHost(context: Context, appVersion: String? = null): AndroidPostHogAnalyticsHost =
+    synchronized(lock) {
+      analytics?.also { host -> appVersion?.let { host.updateApplicationContext(it, 0) } }
+        ?: AndroidPostHogAnalyticsHost(context, appVersion ?: applicationVersion(context))
+          .also { analytics = it }
+    }
+
+  internal fun refreshAnalyticsContext(engine: MobileEngine, appVersion: String? = null) {
+    val count = runCatching { engine.listDevices().size }.getOrDefault(0)
+    val host = synchronized(lock) { analytics }
+    host?.updateApplicationContext(appVersion ?: "unknown", count)
+    val spaceId = runCatching { engine.querySpaceState().spaceId }.getOrNull()
+    host?.ensureSpaceContext(spaceId, count)
+  }
+
+  private fun applicationVersion(context: Context): String = runCatching {
+    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
+  }.getOrDefault("unknown")
+
+  /**
+   * Starts the Engine, or attaches to one that is already running. A second start from a runtime
+   * that is already attached is still a caller error.
+   */
+  internal fun start(context: Context, config: Map<String, String>, allowAttach: Boolean) =
+    transitions.withLockHeld { startLocked(context, config, allowAttach) }
+
+  private fun startLocked(context: Context, config: Map<String, String>, allowAttach: Boolean) {
+    val diagnostics = AndroidNativeDiagnostics.get(context)
+    AndroidNativeDiagnostics.observe(diagnostics, NativeDiagnosticEvent.ENGINE_START, NativeDiagnosticTrigger.APP_STARTUP) {
+      synchronized(lock) {
+        if (engine != null || startupLifecycle != null) {
+          if (allowAttach) return@observe
+          throw UcEngineAlreadyStartedException()
+        }
+      }
+      check(UcEngineModule.installAndroidContext(context)) { "Failed to initialize the Android P2P runtime" }
+      val registry = FileHandleRegistry(context)
+      val appVersion = config["appVersion"] ?: applicationVersion(context)
+      val analytics = analyticsHost(context, appVersion)
+      val host = AndroidEngineHost(context, registry)
+      val logSetup = installProcessObservability(
+        BindingObservabilityConfig(
+          serviceVersion = engineServiceVersion(appVersion),
+          environment = if (BuildConfig.DEBUG) BindingDeploymentEnvironment.DEVELOPMENT else BindingDeploymentEnvironment.PRODUCTION,
+          appChannel = analyticsContext().appChannel,
+          remoteDiagnosticsEnabled = false,
+          collector = null
+        ),
+        host
+      )
+      synchronized(lock) { logInstallation = logSetup }
+      EngineDiagnosticBridge.register()
+      AndroidNativeDiagnostics.replayNetworkToEngine()
+      val startup = MobileStartupLifecycle()
+      synchronized(lock) {
+        if (engine != null || startupLifecycle != null) {
+          if (allowAttach) return@observe
+          throw UcEngineAlreadyStartedException()
+        }
+        startupLifecycle = startup
+      }
+      val started = try {
+        EngineDiagnosticBridge.observe(BindingHostDiagnosticAction.RUNTIME_START) {
+          MobileEngine.startWithAnalyticsAndLifecycle(
+            BindingConfig(appVersion, config["profileId"] ?: "default"),
+            host,
+            analytics,
+            analyticsContext(),
+            startup
+          )
+        }
+      } catch (error: Throwable) {
+        synchronized(lock) { if (startupLifecycle === startup) startupLifecycle = null }
+        throw error
+      }
+      try {
+        lifecycle.prepare(AndroidEngineLifecycle(started, diagnostics))
+        refreshAnalyticsContext(started, appVersion)
+      } catch (error: Throwable) {
+        synchronized(lock) { if (startupLifecycle === startup) startupLifecycle = null }
+        try {
+          started.shutdown(2_000u)
+        } catch (shutdownError: Throwable) {
+          reportLifecycleError(shutdownError)
+        }
+        started.close()
+        throw error
+      }
+      synchronized(lock) {
+        if (engine != null) {
+          started.close()
+          throw UcEngineAlreadyStartedException()
+        }
+        files = registry
+        engine = started
+        if (startupLifecycle === startup) startupLifecycle = null
+      }
+    }
+  }
+
+  /**
+   * Native-initiated start for recovery while no JS runtime exists (sticky restart, boot).
+   * Returns true when an Engine is running afterwards.
+   */
+  fun startNative(context: Context): Boolean {
+    val appContext = context.applicationContext
+    return try {
+      start(appContext, mapOf("appVersion" to applicationVersion(appContext), "profileId" to "default"), allowAttach = true)
+      engine() != null
+    } catch (error: Throwable) {
+      reportLifecycleError(error)
+      false
+    }
+  }
+
+  private val hintExecutor by lazy { java.util.concurrent.Executors.newSingleThreadExecutor { Thread(it, "uc-network-hint") } }
+
+  /**
+   * Tells a running Engine the default network changed, from the native connectivity callback.
+   * The JS runtime reports the same hint while it is alive; a hint only prompts the Engine to retry
+   * its connections, so a duplicate costs one extra attempt.
+   */
+  internal fun hintNetworkChanged() {
+    val active = engine() ?: return
+    hintExecutor.execute {
+      runCatching { active.notifyConnectivityOpportunity(ConnectivityOpportunity.NETWORK_CHANGED) }
+        .onSuccess { Log.i("UcEngine", "native_network_hint outcome=delivered") }
+        .onFailure { Log.w("UcEngine", "native_network_hint outcome=failed errorKind=${it.javaClass.simpleName}") }
+    }
+  }
+
+  /** The background service holds the Engine alive across JS runtime destruction. */
+  /** Only ever prevents a shutdown, so it needs no transition lock and never blocks the caller's thread. */
+  fun retain() {
+    synchronized(lock) { retainers += 1 }
+    Log.i("UcEngine", "engine_owner retain retainers=${retainerCount()}")
+  }
+
+  private val releaseExecutor by lazy { java.util.concurrent.Executors.newSingleThreadExecutor { Thread(it, "uc-engine-release") } }
+
+  /**
+   * Releases a hold off the caller's thread (the service's main thread must not wait for a start or
+   * a shutdown); the Engine is shut down when nothing else needs it and no JS runtime is attached.
+   */
+  fun release(context: Context) {
+    val appContext = context.applicationContext
+    releaseExecutor.execute { releaseNow(appContext) }
+  }
+
+  private fun releaseNow(context: Context) = transitions.withLockHeld {
+    val stop = synchronized(lock) {
+      retainers = (retainers - 1).coerceAtLeast(0)
+      retainers == 0 && attachedRuntimes == 0
+    }
+    Log.i("UcEngine", "engine_owner release retainers=${retainerCount()} shutdown=$stop")
+    if (stop) runCatching { shutdownUntilComplete(context.applicationContext) }.onFailure(::reportLifecycleError)
+  }
+
+  private var attachedRuntimes = 0
+
+  internal fun runtimeAttached() = transitions.withLockHeld {
+    synchronized(lock) { attachedRuntimes += 1 }
+    Log.i("UcEngine", "engine_owner runtime_attached runtimes=$attachedRuntimes")
+  }
+
+  /** A JS runtime was destroyed; the Engine survives when the background service still holds it. */
+  internal fun runtimeDetached(context: Context?) = transitions.withLockHeld {
+    val stop = synchronized(lock) {
+      attachedRuntimes = (attachedRuntimes - 1).coerceAtLeast(0)
+      retainers == 0 && attachedRuntimes == 0
+    }
+    Log.i("UcEngine", "engine_owner runtime_detached retainers=${retainerCount()} shutdown=${stop && context != null}")
+    if (stop && context != null) runCatching { shutdownUntilComplete(context) }.onFailure(::reportLifecycleError)
+  }
+
+  internal fun setBackgroundSyncEnabled(context: Context, enabled: Boolean, appIsBackground: Boolean) =
+    transitions.withLockHeld {
+      val diagnostics = AndroidNativeDiagnostics.get(context)
+      lifecycle.setBackgroundSyncEnabled(
+        engine()?.let { AndroidEngineLifecycle(it, diagnostics) },
+        enabled,
+        appIsBackground
+      )
+    }
+
+  internal fun enterBackground(context: Context) =
+    transitions.withLockHeld { lifecycle.enterBackground(currentLifecycle(context)) }
+
+  internal fun enterForeground(context: Context) =
+    transitions.withLockHeld { lifecycle.enterForeground(currentLifecycle(context)) }
+
+  internal fun shutdown(context: Context, deadlineMs: Long) = transitions.withLockHeld {
+    shutdownLocked(context, deadlineMs)
+  }
+
+  private inline fun <T> java.util.concurrent.locks.ReentrantLock.withLockHeld(block: () -> T): T {
+    lock()
+    try { return block() } finally { unlock() }
+  }
+
+  private fun shutdownLocked(context: Context, deadlineMs: Long) {
+    val diagnostics = AndroidNativeDiagnostics.get(context)
+    val active = engine()
+    try {
+      active?.let {
+        AndroidNativeDiagnostics.observe(diagnostics, NativeDiagnosticEvent.ENGINE_SHUTDOWN) {
+          it.shutdown(deadlineMs.toULong())
+        }
+      }
+      val registry = synchronized(lock) {
+        if (engine === active) {
+          engine = null
+          files.also { files = null }
+        } else null
+      }
+      active?.close()
+      registry?.removeAll()
+    } finally { diagnostics.flush() }
+  }
+
+  internal fun shutdownUntilComplete(context: Context) = transitions.withLockHeld {
+    while (true) {
+      try {
+        shutdownLocked(context, 5_000)
+        return
+      } catch (error: BindingException.Engine) {
+        if (error.category != BindingErrorCategory.DEADLINE_EXCEEDED) throw error
+      }
+    }
+  }
+}
+
 class UcEngineModule : Module() {
   companion object {
     init {
@@ -349,16 +628,20 @@ class UcEngineModule : Module() {
 
     @JvmStatic
     private external fun nativeInstallAndroidContext(context: Context): Boolean
+
+    // The JNI symbol is bound to this class, so the owner reaches it through this wrapper.
+    fun installAndroidContext(context: Context): Boolean = nativeInstallAndroidContext(context)
   }
 
-  private var logInstallation: BindingObservabilitySetup? = null
-  private val lock = Any()
-  private val lifecycle = NativeLifecycleHost(::reportLifecycleError)
   private val diagnostics by lazy { AndroidNativeDiagnostics.get(requireContext()) }
-  private var engine: MobileEngine? = null
-  private var startupLifecycle: MobileStartupLifecycle? = null
-  private var files: FileHandleRegistry? = null
-  private var analytics: AndroidPostHogAnalyticsHost? = null
+
+  // This module is a view onto the process-wide EngineOwner. It reports whether this JS runtime has
+  // already attached, so a second start call from the same runtime is still an error.
+  private var attached = false
+
+  // The react context can already be gone when the module is destroyed; the last runtime to detach
+  // still needs a context to shut the Engine down when no service holds it.
+  private var attachedContext: Context? = null
 
   // Process diagnostics are available before the first synchronization session.
   private fun prepareDiagnosticLogging() {
@@ -371,7 +654,7 @@ class UcEngineModule : Module() {
         analyticsContext().appChannel, false, null),
       AndroidEngineHost(context, FileHandleRegistry(context))
     )
-    synchronized(lock) { logInstallation = setup }
+    EngineOwner.setLogInstallation(setup)
     EngineDiagnosticBridge.register()
     AndroidNativeDiagnostics.replayNetworkToEngine()
   }
@@ -407,7 +690,7 @@ class UcEngineModule : Module() {
 
     AsyncFunction("getEngineLogStatus") {
       val health = runCatching { queryProcessObservabilityHealth() }.getOrNull()
-      val setup = synchronized(lock) { logInstallation }
+      val setup = EngineOwner.logInstallation()
       mapOf(
         "localFile" to (health?.localFile?.name?.lowercase(java.util.Locale.ROOT) ?: "unavailable"),
         "droppedLocalRecords" to health?.droppedLocalRecords?.toDouble(),
@@ -421,87 +704,31 @@ class UcEngineModule : Module() {
     }
 
     AsyncFunction("start") { config: Map<String, String> ->
-      AndroidNativeDiagnostics.observe(diagnostics, NativeDiagnosticEvent.ENGINE_START, NativeDiagnosticTrigger.APP_STARTUP) {
-        val context = requireContext()
-        check(nativeInstallAndroidContext(context)) { "Failed to initialize the Android P2P runtime" }
-        val registry = FileHandleRegistry(context)
-        val appVersion = config["appVersion"] ?: "unknown"
-        val analytics = analyticsHost(context, appVersion)
-        val host = AndroidEngineHost(context, registry)
-        val logSetup = installProcessObservability(
-          BindingObservabilityConfig(
-            serviceVersion = engineServiceVersion(appVersion),
-            environment = if (BuildConfig.DEBUG) BindingDeploymentEnvironment.DEVELOPMENT else BindingDeploymentEnvironment.PRODUCTION,
-            appChannel = analyticsContext().appChannel,
-            remoteDiagnosticsEnabled = false,
-            collector = null
-          ),
-          host
-        )
-        synchronized(lock) { logInstallation = logSetup }
-        EngineDiagnosticBridge.register()
-        AndroidNativeDiagnostics.replayNetworkToEngine()
-        val startup = MobileStartupLifecycle()
-        synchronized(lock) {
-          if (engine != null || startupLifecycle != null) throw UcEngineAlreadyStartedException()
-          startupLifecycle = startup
-        }
-        val started = try {
-          EngineDiagnosticBridge.observe(BindingHostDiagnosticAction.RUNTIME_START) {
-            MobileEngine.startWithAnalyticsAndLifecycle(
-              BindingConfig(
-                appVersion,
-                config["profileId"] ?: "default"
-              ),
-              host,
-              analytics,
-              analyticsContext(),
-              startup
-            )
-          }
-        } catch (error: Throwable) {
-          synchronized(lock) {
-            if (startupLifecycle === startup) startupLifecycle = null
-          }
-          throw error
-        }
-        try {
-          lifecycle.prepare(AndroidEngineLifecycle(started, diagnostics))
-          refreshAnalyticsContext(started, appVersion)
-        } catch (error: Throwable) {
-          synchronized(lock) {
-            if (startupLifecycle === startup) startupLifecycle = null
-          }
-          try {
-            started.shutdown(2_000u)
-          } catch (shutdownError: Throwable) {
-            reportLifecycleError(shutdownError)
-          }
-          started.close()
-          throw error
-        }
-        synchronized(lock) {
-          if (engine != null) {
-            started.close()
-            throw UcEngineAlreadyStartedException()
-          }
-          files = registry
-          engine = started
-          if (startupLifecycle === startup) startupLifecycle = null
-        }
+      val context = requireContext()
+      // An engine already running (kept by the background service while this runtime was gone) is
+      // attached to, not started a second time: there is one Engine per profile.
+      // Attach first: the service may release its hold at any moment, and an Engine that is
+      // started while no runtime is counted would be shut down by that release.
+      val firstAttach = !attached
+      if (firstAttach) {
+        EngineOwner.runtimeAttached()
+        attached = true
+        attachedContext = context.applicationContext
+      }
+      try {
+        EngineOwner.start(context, config, allowAttach = firstAttach)
+      } catch (error: Throwable) {
+        if (firstAttach) { attached = false; attachedContext = null; EngineOwner.runtimeDetached(context) }
+        throw error
       }
     }
 
-    AsyncFunction("shutdown") { deadlineMs: Long -> shutdown(deadlineMs) }
-    AsyncFunction("shutdownUntilComplete") { shutdownUntilComplete() }
+    AsyncFunction("shutdown") { deadlineMs: Long -> EngineOwner.shutdown(requireContext(), deadlineMs) }
+    AsyncFunction("shutdownUntilComplete") { EngineOwner.shutdownUntilComplete(requireContext()) }
     AsyncFunction("suspend") { requireEngine().suspend() }
     AsyncFunction("resume") { requireEngine().resume() }
     AsyncFunction("setBackgroundSyncEnabled") { enabled: Boolean, appIsBackground: Boolean ->
-      lifecycle.setBackgroundSyncEnabled(
-        currentEngine()?.let { AndroidEngineLifecycle(it, diagnostics) },
-        enabled,
-        appIsBackground
-      )
+      EngineOwner.setBackgroundSyncEnabled(requireContext(), enabled, appIsBackground)
     }
     AsyncFunction("getAnalyticsConsent") {
       analyticsHost(requireContext()).consentEnabled()
@@ -750,8 +977,20 @@ class UcEngineModule : Module() {
       sendReportMap(requireEngine().sendFiles(fileHandles, targetDevices))
     }
     AsyncFunction("captureCurrentClipboard") { requireEngine().captureCurrentClipboard() }
-    AsyncFunction("observeClipboardChange") { dispatch: Boolean ->
-      requireEngine().observeClipboardChange(dispatch)?.let(::sendReportMap)
+    AsyncFunction("observeClipboardChange") { dispatch: Boolean, captured: Map<String, String>? ->
+      val handoff = captured?.let {
+        CapturedClipboard(it["text"], it["fileUri"], it["mimeType"], it["displayName"])
+      }
+      // Counts only: clipboard content never reaches the logs.
+      android.util.Log.i(
+        "UcClipboardObserve",
+        "observe dispatch=$dispatch captured=${if (handoff == null) "none" else if (handoff.fileUri != null) "file" else "text"} bytes=${handoff?.text?.length ?: 0}"
+      )
+      CapturedClipboardHandoff.whileStaged(handoff) {
+        requireEngine().observeClipboardChange(dispatch)?.let(::sendReportMap).also {
+          android.util.Log.i("UcClipboardObserve", "observe finished report=${it != null}")
+        }
+      }
     }
     AsyncFunction("restoreClipboard") { entryId: String, mode: String ->
       restoreOutcome(requireEngine().restoreClipboard(entryId, restoreMode(mode)))
@@ -763,35 +1002,26 @@ class UcEngineModule : Module() {
     OnActivityEntersBackground {
       EngineDiagnosticBridge.record(BindingHostDiagnosticEvent.Lifecycle(BindingHostLifecycleState.BACKGROUND))
       diagnostics.record(NativeDiagnosticEvent.APP_BACKGROUND, NativeDiagnosticTrigger.APP_BACKGROUND)
-      lifecycle.enterBackground(currentLifecycle())
+      EngineOwner.enterBackground(requireContext())
     }
     OnActivityEntersForeground {
       EngineDiagnosticBridge.record(BindingHostDiagnosticEvent.Lifecycle(BindingHostLifecycleState.FOREGROUND))
       diagnostics.record(NativeDiagnosticEvent.APP_FOREGROUND, NativeDiagnosticTrigger.APP_FOREGROUND)
-      lifecycle.enterForeground(currentLifecycle())
+      EngineOwner.enterForeground(requireContext())
     }
     OnDestroy {
-      try {
-        shutdownUntilComplete()
-      } catch (error: Throwable) {
-        reportLifecycleError(error)
-      }
+      // The Engine outlives this runtime while the background service holds it.
+      if (attached) EngineOwner.runtimeDetached(attachedContext ?: appContext.reactContext?.applicationContext)
+      attached = false
+      attachedContext = null
     }
   }
 
   private fun analyticsHost(context: Context, appVersion: String? = null): AndroidPostHogAnalyticsHost =
-    synchronized(lock) {
-      analytics?.also { host -> appVersion?.let { host.updateApplicationContext(it, 0) } }
-        ?: AndroidPostHogAnalyticsHost(context, appVersion ?: applicationVersion())
-          .also { analytics = it }
-    }
+    EngineOwner.analyticsHost(context, appVersion)
 
-  private fun refreshAnalyticsContext(engine: MobileEngine, appVersion: String? = null) {
-    val count = runCatching { engine.listDevices().size }.getOrDefault(0)
-    analytics?.updateApplicationContext(appVersion ?: applicationVersion(), count)
-    val spaceId = runCatching { engine.querySpaceState().spaceId }.getOrNull()
-    analytics?.ensureSpaceContext(spaceId, count)
-  }
+  private fun refreshAnalyticsContext(engine: MobileEngine, appVersion: String? = null) =
+    EngineOwner.refreshAnalyticsContext(engine, appVersion)
 
   private fun applicationVersion(): String = runCatching {
     val context = requireContext()
@@ -801,17 +1031,9 @@ class UcEngineModule : Module() {
   private fun requireContext(): Context =
     appContext.reactContext?.applicationContext ?: throw UcEngineUnavailableException()
 
-  private fun currentEngine(): MobileEngine? = synchronized(lock) { engine }
+  private fun requireEngine(): MobileEngine = EngineOwner.engine() ?: throw UcEngineNotStartedException()
 
-  private fun currentLifecycle(): EngineLifecycle? = synchronized(lock) {
-    engine?.let { AndroidEngineLifecycle(it, diagnostics) }
-      ?: startupLifecycle?.let(::AndroidStartupLifecycle)
-  }
-
-  private fun requireEngine(): MobileEngine = currentEngine() ?: throw UcEngineNotStartedException()
-
-  private fun requireFiles(): FileHandleRegistry =
-    synchronized(lock) { files } ?: throw UcEngineNotStartedException()
+  private fun requireFiles(): FileHandleRegistry = EngineOwner.files() ?: throw UcEngineNotStartedException()
 
   private fun <T> runSpaceRead(operation: String, read: () -> T): T = try {
     read()
@@ -830,40 +1052,6 @@ class UcEngineModule : Module() {
         "UcEngine",
         "space_read operation=$operation outcome=failure errorKind=${error.javaClass.simpleName}"
       )
-    }
-  }
-
-  private fun reportLifecycleError(error: Throwable) {
-    Log.e("UcEngine", "P2P engine lifecycle transition failed", error)
-  }
-
-  private fun shutdown(deadlineMs: Long) {
-    val active = currentEngine()
-    try {
-      active?.let {
-        AndroidNativeDiagnostics.observe(diagnostics, NativeDiagnosticEvent.ENGINE_SHUTDOWN) {
-          it.shutdown(deadlineMs.toULong())
-        }
-      }
-      val registry = synchronized(lock) {
-        if (engine === active) {
-          engine = null
-          files.also { files = null }
-        } else null
-      }
-      active?.close()
-      registry?.removeAll()
-    } finally { diagnostics.flush() }
-  }
-
-  private fun shutdownUntilComplete() {
-    while (true) {
-      try {
-        shutdown(5_000)
-        return
-      } catch (error: BindingException.Engine) {
-        if (error.category != BindingErrorCategory.DEADLINE_EXCEEDED) throw error
-      }
     }
   }
 
@@ -1091,6 +1279,7 @@ private class AndroidEngineHost(
   override fun fileFinishWrite(handle: String) = files.finishWrite(handle)
 
   override fun clipboardRead(): BindingClipboardSnapshot {
+    CapturedClipboardHandoff.current()?.let { return capturedSnapshot(it) }
     val clipboard = context.getSystemService(ClipboardManager::class.java)
       ?: throw HostBindingException.Unavailable()
     try {
@@ -1098,17 +1287,7 @@ private class AndroidEngineHost(
         ?: return BindingClipboardSnapshot(System.currentTimeMillis(), emptyList())
       val uri = item.uri
       val representations = if (uri != null) {
-        val handle = files.register(uri.toString(), false)
-        val metadata = files.metadata(handle)
-        listOf(
-          BindingClipboardRepresentation.File(
-            metadata.mimeType ?: "application/octet-stream",
-            handle,
-            metadata.displayName,
-            metadata.mimeType,
-            metadata.sizeBytes
-          )
-        )
+        listOf(fileRepresentation(uri.toString(), null, null))
       } else {
         val text = item.coerceToText(context)?.toString().orEmpty()
         listOf(BindingClipboardRepresentation.Inline("text/plain", "text/plain", text.toByteArray()))
@@ -1117,6 +1296,32 @@ private class AndroidEngineHost(
     } catch (_: SecurityException) {
       throw HostBindingException.PermissionDenied()
     }
+  }
+
+  private fun capturedSnapshot(captured: CapturedClipboard): BindingClipboardSnapshot {
+    val representations = when {
+      captured.fileUri != null -> listOf(fileRepresentation(captured.fileUri, captured.mimeType, captured.displayName))
+      captured.text != null ->
+        listOf(BindingClipboardRepresentation.Inline("text/plain", "text/plain", captured.text.toByteArray()))
+      else -> emptyList()
+    }
+    return BindingClipboardSnapshot(System.currentTimeMillis(), representations)
+  }
+
+  private fun fileRepresentation(uri: String, mimeType: String?, displayName: String?): BindingClipboardRepresentation {
+    val handle = files.register(uri, false, displayName)
+    val metadata = files.metadata(handle)
+    // A captured file:// path has no content type from the resolver; the extension still names it.
+    val mime = mimeType ?: metadata.mimeType
+      ?: MimeTypeMap.getFileExtensionFromUrl(uri)?.takeIf { it.isNotEmpty() }
+        ?.let { MimeTypeMap.getSingleton().getMimeTypeFromExtension(it.lowercase()) }
+    return BindingClipboardRepresentation.File(
+      mime ?: "application/octet-stream",
+      handle,
+      metadata.displayName,
+      mime,
+      metadata.sizeBytes
+    )
   }
 
   override fun clipboardWrite(snapshot: BindingClipboardSnapshot) {
