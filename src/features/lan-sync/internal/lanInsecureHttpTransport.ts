@@ -1,9 +1,14 @@
 export interface LanInsecureHttpTransport {
   getJson(
     url: string,
+    headers: Record<string, string>,
+    signal?: AbortSignal
+  ): Promise<{ status: number; data?: unknown }>;
+  putJson(
+    url: string,
+    body: unknown,
     headers: Record<string, string>
   ): Promise<{ status: number; data?: unknown }>;
-  putJson(url: string, body: unknown, headers: Record<string, string>): Promise<{ status: number }>;
   uploadFile(
     sourceUri: string,
     url: string,
@@ -30,12 +35,25 @@ function nativePath(uri: string): string {
 export class ReactNativeBlobLanTransport implements LanInsecureHttpTransport {
   async getJson(
     url: string,
-    headers: Record<string, string>
+    headers: Record<string, string>,
+    signal?: AbortSignal
   ): Promise<{ status: number; data?: unknown }> {
     const transport = await blobUtil();
-    const response = await transport
+    if (signal?.aborted) throw new Error('LAN request was cancelled');
+    const task = transport
       .config({ trusty: true, timeout: REQUEST_TIMEOUT_MS })
       .fetch('GET', url, headers);
+    // Cancelling the native task stops the request itself, not only the JS promise waiting for it.
+    const cancel = () => {
+      task.cancel(() => undefined);
+    };
+    signal?.addEventListener('abort', cancel, { once: true });
+    let response: Awaited<typeof task>;
+    try {
+      response = await task;
+    } finally {
+      signal?.removeEventListener('abort', cancel);
+    }
     const status = response.info().status;
     const text = await response.text();
     if (!text) return { status };
@@ -50,12 +68,18 @@ export class ReactNativeBlobLanTransport implements LanInsecureHttpTransport {
     url: string,
     body: unknown,
     headers: Record<string, string>
-  ): Promise<{ status: number }> {
+  ): Promise<{ status: number; data?: unknown }> {
     const transport = await blobUtil();
     const response = await transport
       .config({ trusty: true, timeout: REQUEST_TIMEOUT_MS })
       .fetch('PUT', url, { ...headers, 'content-type': 'application/json' }, JSON.stringify(body));
-    return { status: response.info().status };
+    let data: unknown;
+    try {
+      data = JSON.parse(response.data);
+    } catch {
+      data = undefined;
+    }
+    return { status: response.info().status, data };
   }
 
   async uploadFile(
