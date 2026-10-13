@@ -46,6 +46,7 @@ import {
   createTextSendJob,
   releaseHistorySendJob,
 } from '@/utils/historySendJob';
+import { readHistoryItemText } from '@/utils/historyItemText';
 import type { PendingShareJob } from '@/features/transfer';
 import { useUndoableHistoryDelete } from './useUndoableHistoryDelete';
 import { useHistoryDisplaySettings } from '@/hooks/useHistoryDisplaySettings';
@@ -347,29 +348,43 @@ export function useHomeController(
   const releaseSendToJobs = useCallback(() => {
     sendToJobsRef.current?.forEach(releaseHistorySendJob);
   }, []);
+  // 准备发送 job 需要读全文文件(异步)。请求串行执行:同一条目的 payload 路径相同(`<hash>.txt`),
+  // 并行准备时,过期请求的释放会删掉最新请求刚写好的文件;串行后过期请求在自己准备前直接跳过。
+  const sendToRequestRef = useRef(0);
+  const sendToQueueRef = useRef<Promise<void>>(Promise.resolve());
   const presentSendTo = useCallback(
-    (prepare: () => PendingShareJob[]) => {
-      releaseSendToJobs();
-      let jobs: PendingShareJob[] = [];
-      try {
-        jobs = prepare();
-      } catch (error) {
-        log.error(`Failed to prepare send-to job (${getErrorCode(error)})`);
-      }
-      if (jobs.length === 0) {
-        showMessage(t('toast.sendToUnavailable'), 'error');
-        return;
-      }
-      sendToJobsRef.current = jobs;
-      setSendToJobs(jobs);
-      setSendToVisible(true);
+    (prepare: () => PendingShareJob[] | Promise<PendingShareJob[]>) => {
+      const request = ++sendToRequestRef.current;
+      const run = sendToQueueRef.current.then(async () => {
+        if (request !== sendToRequestRef.current) return;
+        releaseSendToJobs();
+        let jobs: PendingShareJob[] = [];
+        try {
+          jobs = await prepare();
+        } catch (error) {
+          log.error(`Failed to prepare send-to job (${getErrorCode(error)})`);
+        }
+        if (request !== sendToRequestRef.current) {
+          jobs.forEach(releaseHistorySendJob);
+          return;
+        }
+        if (jobs.length === 0) {
+          showMessage(t('toast.sendToUnavailable'), 'error');
+          return;
+        }
+        sendToJobsRef.current = jobs;
+        setSendToJobs(jobs);
+        setSendToVisible(true);
+      });
+      sendToQueueRef.current = run.catch(() => undefined);
+      return run;
     },
     [releaseSendToJobs, showMessage, t]
   );
   const openSendTo = useCallback(
     (item: ClipboardItem) =>
-      presentSendTo(() => {
-        const job = createHistorySendJob(item, getDisplayKind(item.type, item.text));
+      presentSendTo(async () => {
+        const job = await createHistorySendJob(item, getDisplayKind(item.type, item.text));
         return job ? [job] : [];
       }),
     [presentSendTo]
@@ -469,11 +484,13 @@ export function useHomeController(
         onSelectText: () => {
           // 动作经 close(after) 在浮层退场后才执行，那时 contextTarget 已清空——
           // 这里提前把锚点捕获进闭包，分词浮层才能从同一张卡片原位生长
-          setWordPickerTarget({ text: item.text, anchor, deviceName: item.deviceName });
+          void readHistoryItemText(item).then((text) =>
+            setWordPickerTarget({ text, anchor, deviceName: item.deviceName })
+          );
         },
         onCopyPlainText: async () => {
           const Clipboard = await import('expo-clipboard');
-          await Clipboard.setStringAsync(item.text);
+          await Clipboard.setStringAsync(await readHistoryItemText(item));
           showMessage(t('toast.copiedPlainText'), 'success');
         },
         onOpenInBrowser: () => {
@@ -534,7 +551,7 @@ export function useHomeController(
           ) {
             await shareFile(item.fileUri, item.dataName);
           } else {
-            await Share.share({ message: item.text });
+            await Share.share({ message: await readHistoryItemText(item) });
           }
         },
         onSelect: () => {
@@ -625,7 +642,7 @@ export function useHomeController(
 
   const handleBatchCopy = useCallback(async () => {
     const selected = items.filter((i) => selectedIds.has(i.profileHash));
-    const texts = selected.map((i) => i.text).join('\n');
+    const texts = (await Promise.all(selected.map(readHistoryItemText))).join('\n');
     const Clipboard = await import('expo-clipboard');
     await Clipboard.setStringAsync(texts);
     showMessage(t('toast.copiedSelected'), 'success');
@@ -636,16 +653,18 @@ export function useHomeController(
   const handleBatchSendTo = useCallback(() => {
     const selected = items.filter((i) => selectedIds.has(i.profileHash));
     exitSelectMode();
-    presentSendTo(() =>
-      selected
-        .map((item) => createHistorySendJob(item, getDisplayKind(item.type, item.text)))
-        .filter((job): job is PendingShareJob => job != null)
+    presentSendTo(async () =>
+      (
+        await Promise.all(
+          selected.map((item) => createHistorySendJob(item, getDisplayKind(item.type, item.text)))
+        )
+      ).filter((job): job is PendingShareJob => job != null)
     );
   }, [items, selectedIds, exitSelectMode, presentSendTo]);
 
   const handleBatchShare = useCallback(async () => {
     const selected = items.filter((i) => selectedIds.has(i.profileHash));
-    const texts = selected.map((i) => i.text).join('\n');
+    const texts = (await Promise.all(selected.map(readHistoryItemText))).join('\n');
     await Share.share({ message: texts });
     exitSelectMode();
   }, [items, selectedIds, exitSelectMode]);
