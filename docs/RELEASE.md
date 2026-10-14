@@ -282,17 +282,17 @@ git commit -m "chore(release): X.Y.Z.B"
 git push origin main
 ```
 
-In GitHub Actions, open `build`, choose **Run workflow** on `main`, enable
-`publish_release`, choose `platforms` (`both`, `android`, or `ios`), and leave
-the iOS dev-build inputs empty. The workflow then:
+In GitHub Actions, open `release`, choose **Run workflow** on `main`, and
+choose `platforms` (`both`, `android`, or `ios`). The workflow then:
 
 1. Validates that Android/iOS build counters and both changelog files describe
    the same release, and that both top sections can generate release notes.
 2. Refuses the build number if a release tag or App Store Connect already has
    it (see "Build Counter Rule").
-3. Runs style checks, unit tests, and the selected Android and/or iOS builds.
-4. Creates the derived tag only after every check and the selected builds
-   succeed.
+3. Builds the selected Android and/or iOS platforms. Quality checks run in
+   the separate PR and main-push CI workflows, not in this release workflow.
+4. Creates the derived tag only after release preparation and the selected
+   builds succeed.
 5. iOS selected: uploads the same validated iOS artifact to TestFlight.
 6. Publishes a GitHub Release whose body covers the selected platforms. With
    Android, it carries the `arm64-v8a` APK supported by the unified engine
@@ -404,7 +404,7 @@ point of failure for new mirrors only; users are never affected when it is down.
 Run `npm run release:alpha` to create the next build metadata and the next
 Alpha sequence. It prints a tag such as `v1.3.0.166-alpha.1`; use that exact
 tag as the first line of both changelog files, then use the normal manual
-`publish_release` flow. Android Alpha installs automatically use the test
+`release` workflow. Android Alpha installs automatically use the test
 update channel on first launch, so they receive the next Alpha or stable build.
 CI marks Alpha tags as prereleases and uploads the iOS build to TestFlight.
 

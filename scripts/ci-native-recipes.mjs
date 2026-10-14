@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { parseDocument } from 'yaml';
 
 export const recipeWorkflows = new Set([
-  '.github/workflows/build.yml', '.github/workflows/build-pr.yml', '.github/workflows/release.yml',
+  '.github/workflows/build.yml', '.github/workflows/build-pr.yml', '.github/workflows/release.yml', '.github/workflows/publish.yml',
   '.github/workflows/android-build.yml', '.github/workflows/ios-build-check.yml',
 ]);
 const gate = 'inputs.build_required && inputs.validation_passed';
@@ -100,7 +100,7 @@ function releaseRecipe(workflow) {
 export function sameNativeRecipe(path, before, after) {
   if (!recipeWorkflows.has(path)) return false;
   try {
-    const normalize = path.endsWith('/release.yml') ? releaseRecipe
+    const normalize = path.endsWith('/publish.yml') ? releaseRecipe
       : /\/(?:android-build|ios-build-check)\.yml$/.test(path) ? nativeRecipe : orchestrationRecipe;
     return isDeepStrictEqual(normalize(readYaml(before)), normalize(readYaml(after)));
   } catch {

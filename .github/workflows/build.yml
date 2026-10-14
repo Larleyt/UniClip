@@ -9,13 +9,8 @@ on:
       - main
   workflow_dispatch:
     inputs:
-      publish_release:
-        description: 'Validate, build the selected platforms, create the tag, and publish the release'
-        required: false
-        default: false
-        type: boolean
       platforms:
-        description: 'Platforms to build and publish (every release consumes one shared build number)'
+        description: 'Platforms to build'
         required: false
         default: both
         type: choice
@@ -34,7 +29,7 @@ on:
         type: boolean
 
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && (inputs.publish_release || inputs.upload_testflight) && 'uniclip-release' || format('uniclip-build-{0}', github.ref) }}
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_testflight && 'uniclip-release' || format('uniclip-build-{0}', github.ref) }}
   cancel-in-progress: false
 
 jobs:
@@ -45,12 +40,9 @@ jobs:
   prepare:
     name: Prepare
     runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.release-metadata.outputs.tag }}
-      prerelease: ${{ steps.release-metadata.outputs.prerelease }}
     steps:
       - name: Validate iOS dev build request
-        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish_release }}
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
           BUILD_NUMBER: ${{ inputs.build_number }}
           UPLOAD_TESTFLIGHT: ${{ inputs.upload_testflight }}
@@ -60,78 +52,6 @@ jobs:
             echo "The iOS dev-build inputs need platforms set to both or ios" >&2
             exit 1
           fi
-
-      - name: Validate release request
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
-        env:
-          BUILD_NUMBER: ${{ inputs.build_number }}
-          UPLOAD_TESTFLIGHT: ${{ inputs.upload_testflight }}
-          PLATFORMS: ${{ inputs.platforms }}
-        run: |
-          case "$PLATFORMS" in
-            both|android|ios) ;;
-            *) echo "Unknown platforms selection: $PLATFORMS" >&2; exit 1 ;;
-          esac
-          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-            echo "Full releases must run from main, not $GITHUB_REF" >&2
-            exit 1
-          fi
-          if [ -n "$BUILD_NUMBER" ] || [ "$UPLOAD_TESTFLIGHT" = "true" ]; then
-            echo "Full releases cannot use the iOS dev-build overrides" >&2
-            exit 1
-          fi
-
-      - name: Checkout release commit
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Require the latest main commit
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
-        run: |
-          git fetch origin main
-          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
-            echo "The selected commit is no longer the latest main commit" >&2
-            exit 1
-          fi
-
-      - name: Validate and derive release metadata
-        id: release-metadata
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: npm run release:validate
-
-      - name: Require an available release tag
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
-        env:
-          TAG: ${{ steps.release-metadata.outputs.tag }}
-        run: bash scripts/create-release-tag.sh --check
-
-      # One build counter is shared by both platforms, so every release, even a
-      # single-platform one, must use a number no earlier artifact consumed:
-      # neither a release tag nor a TestFlight upload (dev uploads are untagged).
-      - name: Write App Store Connect API key
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
-        env:
-          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
-        run: echo -n "$ASC_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
-
-      - name: Require an unused build number
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
-        env:
-          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
-          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
-          TAG: ${{ steps.release-metadata.outputs.tag }}
-        run: |
-          BUNDLE_ID=$(node -p "require('./app.json').expo.ios.bundleIdentifier")
-          ASC_MAX=$(ruby scripts/asc_latest_build.rb "$ASC_API_KEY_ID" "$ASC_API_ISSUER_ID" "$RUNNER_TEMP/AuthKey.p8" "$BUNDLE_ID")
-          node scripts/check-build-number.mjs --require-origin --ignore-tag "$TAG" --asc-max "$ASC_MAX"
-
-      - name: Clean up API key
-        if: always()
-        run: rm -f "$RUNNER_TEMP/AuthKey.p8"
 
   code-style:
     needs: [prepare]
@@ -159,8 +79,8 @@ jobs:
       validation_passed: ${{ needs.changes.result == 'success' && needs.prepare.result == 'success' && needs.code-style.result == 'success' && needs.unit-tests.result == 'success' }}
       build_reason: ${{ needs.changes.outputs.reason }}
 
-  # Manual runs build iOS. A dev build may optionally upload directly to
-  # TestFlight; a full release leaves uploading to release.yml after tagging.
+  # Manual development builds may optionally upload directly to TestFlight.
+  # Tagged releases have their own entrypoint in release.yml.
   ios-build:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.platforms != 'android' }}
     needs: [prepare, code-style, unit-tests]
@@ -168,36 +88,4 @@ jobs:
     secrets: inherit
     with:
       build_number: ${{ inputs.build_number }}
-      upload_testflight: ${{ !inputs.publish_release && inputs.upload_testflight }}
-
-  # A platform left out of the release is skipped rather than successful, so
-  # these gates spell out which build results count as ready.
-  create-release-tag:
-    name: Create release tag
-    if: >-
-      ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.publish_release &&
-      needs.prepare.result == 'success' && needs.code-style.result == 'success' &&
-      needs.unit-tests.result == 'success' &&
-      (needs.android-build.result == 'success' || (inputs.platforms == 'ios' && needs.android-build.result == 'skipped')) &&
-      (needs.ios-build.result == 'success' || (inputs.platforms == 'android' && needs.ios-build.result == 'skipped')) }}
-    needs: [prepare, code-style, unit-tests, android-build, ios-build]
-    runs-on: ubuntu-latest
-    env:
-      TAG: ${{ needs.prepare.outputs.tag }}
-    steps:
-      - name: Checkout validated commit
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Create tag once
-        run: bash scripts/create-release-tag.sh
-
-  release:
-    if: ${{ !cancelled() && needs.create-release-tag.result == 'success' }}
-    needs: [prepare, code-style, unit-tests, android-build, ios-build, create-release-tag]
-    uses: ./.github/workflows/release.yml
-    secrets: inherit
-    with:
-      tag_name: ${{ needs.prepare.outputs.tag }}
-      platforms: ${{ inputs.platforms }}
+      upload_testflight: ${{ inputs.upload_testflight }}

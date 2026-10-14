@@ -1,5 +1,5 @@
 # Build the iOS app and export a distribution-signed .ipa (App Store) as a
-# workflow artifact. Does NOT upload to TestFlight — release.yml consumes the
+# workflow artifact. Does NOT upload to TestFlight — publish.yml consumes the
 # artifact and uploads it, so all publishing lives in the release flow.
 #
 # The unified engine artifacts are pinned by modules/uc-engine/core-source.json
@@ -20,7 +20,7 @@ on:
         required: false
         type: string
       upload_testflight:
-        description: 'Upload the exported .ipa straight to TestFlight (for manual dev builds; the tagged release path uploads via release.yml instead)'
+        description: 'Upload the exported .ipa straight to TestFlight (for manual dev builds; the tagged release path uploads via publish.yml instead)'
         required: false
         default: false
         type: boolean
@@ -272,7 +272,7 @@ jobs:
 
       # Opt-in direct upload for manual dev builds (no tag or Android release).
       # Tagged releases skip this and upload from the artifact in
-      # release.yml instead.
+      # publish.yml instead.
       - name: Upload to TestFlight (dev build)
         if: ${{ inputs.upload_testflight }}
         env:

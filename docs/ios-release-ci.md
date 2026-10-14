@@ -5,22 +5,27 @@ Automated iOS build + TestFlight upload, modeled on the native iOS app repo's
 
 ## Flow structure
 
-`build.yml` orchestrates three reusable workflows:
+The build and release entrypoints are separate:
 
+```text
+build.yml:   main push / manual development build -> quality checks -> builds
+build-pr.yml: pull request -> quality checks -> builds
+release.yml: manual release -> Prepare -> selected builds -> create tag -> publish.yml
 ```
-push (any branch)       ──▶ code-style + unit-tests + android-build
-manual iOS dev build   ──▶ build-ios (optional TestFlight upload)
-manual release         ──▶ validate + selected builds ──▶ create tag ──▶ release
-```
 
-| Workflow            | Runs on                       | Does                                                                                                                                |
-| ------------------- | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `android-build.yml` | every push / manual release   | Build release APKs (all ABIs) → artifacts                                                                                           |
-| `build-ios.yml`     | manual dev build / release    | Prepare the pinned unified engine, prebuild, archive, export a **distribution-signed `.ipa`** → artifact (no upload)                |
-| `release.yml`       | validated manual release only | Upload the `.ipa` to **TestFlight**; publish APKs to **GitHub Release** and **Cloudflare R2**; register Android in **FlareRelease** |
+| Workflow | Responsibility |
+| --- | --- |
+| `build.yml` | Main-push CI and manual development builds, including optional TestFlight uploads |
+| `release.yml` | Manual release entry; validate metadata, build selected platforms, create tag, publish |
+| `android-build.yml` | Reusable Android `arm64-v8a` APK build and artifact upload |
+| `build-ios.yml` | Reusable Engine preparation, prebuild, archive and signed IPA export; optional dev upload |
+| `publish.yml` | Reusable TestFlight, GitHub Release, R2 and FlareRelease publishing |
 
-All publishing lives in `release.yml`, so a failed lint / test / iOS build
-blocks the GitHub release, R2 upload, and TestFlight upload.
+The release workflow runs no unit tests, lint or coverage checks. Failed release
+preparation or a selected platform build blocks tagging and publishing. PR, main-push
+and manual development builds retain their quality gates. Releases and development
+TestFlight uploads share the `uniclip-release` concurrency group and never cancel an
+in-progress run, because they consume the same build counter.
 
 ## The unified engine
 
@@ -73,9 +78,8 @@ via `asc_profiles.rb install`.
    new marketing version. Update `CHANGES.md` and `CHANGES.en.md` with
    matching tags.
 2. Commit and push the release metadata to `main`. Do not create the tag.
-3. Actions → `build` → _Run workflow_ on `main`; enable `publish_release`, pick
-   `platforms` (`both`, `android`, or `ios`), and leave the dev-build inputs
-   empty.
+3. Actions → `release` → _Run workflow_ on `main`; choose
+   `platforms` (`both`, `android`, or `ios`).
 4. CI validates metadata and both localized release-note sections, refuses a
    build number that a release tag or App Store Connect already has, builds
    the selected platforms, creates the tag only after those builds succeed,
@@ -84,7 +88,8 @@ via `asc_profiles.rb install`.
 5. In App Store Connect → TestFlight: wait for processing, answer export
    compliance, add the build to a testing group.
 
-**Manual iOS dev build** (no tag): Actions → `build` → _Run workflow_. Inputs:
+**Manual iOS dev build** (no tag): Actions → `build` → _Run workflow_; select
+`platforms: ios`. Quality checks run before the build. Inputs:
 
 - leave `upload_testflight` unchecked → runs `build-ios` only: rebuild
   xcframework, archive, export a signed `.ipa` artifact. No upload, no
@@ -102,7 +107,7 @@ via `asc_profiles.rb install`.
 A number consumed this way is not tagged. The next release's check sees it on
 App Store Connect and asks for `npm run release:build -- --after N`.
 
-To publish a release, enable `publish_release`. CI requires matching tags in
+To publish a release, run the separate `release` workflow. It requires matching tags in
 `CHANGES.md` and `CHANGES.en.md`; an Alpha tag (`-alpha.N`) marks the
 GitHub release as a prerelease. The iOS side always goes to TestFlight,
 with localized "What to Test" notes for `zh-Hans` and `en-US`; missing build
