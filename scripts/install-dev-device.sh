@@ -141,20 +141,23 @@ assert_development_project() {
   fi
 }
 
+# Restore and verify the pinned iOS archive from its commit or release cache.
 restore_pinned_ios_engine_impl() {
   local module_dir="$PROJECT_ROOT/modules/uc-engine"
-  local pinned_version
   local cache_dir
   local archive
   local binding
   local module_framework="$module_dir/ios/UniClipboardEngine.xcframework"
 
-  pinned_version="$(node -p "require('$module_dir/core-source.json').version")"
-  cache_dir="$module_dir/.artifacts/$pinned_version"
+  cache_dir="$module_dir/.artifacts/$(node -e '
+    const pin = require(process.argv[1]);
+    process.stdout.write(pin.artifactSource === "commit" ? `commit-${pin.sourceCommit}` : pin.version);
+  ' "$module_dir/core-source.json")"
   archive="$cache_dir/UniClipboardEngine.xcframework.zip"
   binding="$cache_dir/uc_engine_uniffi.swift"
   if [ ! -f "$archive" ] || [ ! -f "$binding" ]; then
     echo "The pinned iOS Engine cache is incomplete: $cache_dir" >&2
+    echo "Run npm run core:prepare -- --platform ios before installing." >&2
     return 1
   fi
 
@@ -164,7 +167,7 @@ restore_pinned_ios_engine_impl() {
   unzip -q "$archive" -d "$module_dir/ios"
   find "$module_framework" -name '._*' -delete
   cp "$binding" "$module_dir/ios/Bindings/uc_engine_uniffi.swift"
-  node "$SCRIPT_DIR/verify-unified-engine-core.mjs" --prepared
+  node "$SCRIPT_DIR/verify-unified-engine-core.mjs" --prepared --platform ios
 }
 
 restore_cached_local_ios_engine_impl() {
@@ -205,7 +208,12 @@ restore_cached_local_ios_engine_impl() {
 }
 
 export -f restore_pinned_ios_engine_impl
+# Serialize pinned restoration while preserving explicitly selected local Engine output.
 restore_pinned_ios_engine() {
+  # Local development owns its output and must not require or restore release artifacts.
+  if [ -n "$LOCAL_ENGINE_OVERRIDE" ]; then
+    return 0
+  fi
   uc_engine_publish "$PROJECT_ROOT" bash -euo pipefail -c restore_pinned_ios_engine_impl
 }
 
@@ -363,6 +371,7 @@ prepare_install_engine() {
   git -C "$ENGINE_ROOT" worktree remove --force "$worktree"
 }
 
+# Build and install the requested iOS variant, preserving the original failure on cleanup.
 install_ios() {
   local device="$1"
   local bindings_cache="${UC_ENGINE_STORAGE_BUILD_DIR:-$LOCAL_ENGINE_BUILD_ROOT}/ios-bindings-cache"
@@ -387,6 +396,8 @@ install_ios() {
       ;;
   esac
 
+  # Confirm cleanup can restore the pinned artifacts before replacing them for installation.
+  restore_pinned_ios_engine
   bash "$SCRIPT_DIR/prepare-ios-development-project.sh"
   assert_development_project ios
   trap 'status=$?; if restore_pinned_ios_engine; then restore_status=0; else restore_status=$?; fi; if [ "$status" -eq 0 ] && [ "$restore_status" -ne 0 ]; then status="$restore_status"; fi; exit "$status"' EXIT
@@ -402,6 +413,7 @@ install_ios() {
   trap - EXIT
 }
 
+# Install a signed release variant, then restore the development project and Engine mode.
 install_ios_release() {
   local device="$1"
   local variant="$2"
@@ -419,6 +431,7 @@ install_ios_release() {
   require_command codesign
   require_command xcodebuild
 
+  restore_pinned_ios_engine
   trap 'status=$?; if restore_development_ios_project; then restore_status=0; else restore_status=$?; fi; if [ "$status" -eq 0 ] && [ "$restore_status" -ne 0 ]; then status="$restore_status"; fi; exit "$status"' EXIT
   APP_VARIANT="$variant" npx expo prebuild --platform ios --no-install
   RCT_IGNORE_PODS_DEPRECATION=0 RCT_SKIP_CODEGEN=0 EXPO_USE_PRECOMPILED_MODULES=0 \
