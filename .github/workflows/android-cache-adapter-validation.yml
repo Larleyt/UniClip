@@ -1,0 +1,111 @@
+name: Android cache adapter diagnosis
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/android-cache-adapter-validation]
+    paths: [.github/workflows/android-cache-adapter-validation.yml]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Prepare pinned toolchain and cargo-ndk
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup target add --toolchain 1.95.0 aarch64-linux-android
+          cargo +1.95.0 install cargo-ndk --version 4.1.2 --locked
+      - name: Compare adapters with identical Android inputs
+        shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: 1.95.0
+          CARGO_INCREMENTAL: '0'
+          MBX_GC_MAX_SIZE: 1GiB
+          MBX_LEARNED_INCREMENTAL: '0'
+          MBX_TARGET_VIEWS: '0'
+          MBX_TARGET_SEED: '0'
+          MBX_CACHE_LINKS: 'true'
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/android-adapter"
+          mkdir -p "$root/fixture/src" "$root/fixture/derive/src" "$root/evidence"
+          cat > "$root/fixture/Cargo.toml" <<'TOML'
+          [package]
+          name = "android-cache-probe"
+          version = "0.1.0"
+          edition = "2021"
+          [dependencies]
+          probe-derive = { path = "derive" }
+          [profile.dev]
+          debug = "line-tables-only"
+          split-debuginfo = "unpacked"
+          [profile.release]
+          panic = "abort"
+          codegen-units = 1
+          lto = true
+          opt-level = "z"
+          debug = "line-tables-only"
+          split-debuginfo = "packed"
+          strip = "symbols"
+          TOML
+          cat > "$root/fixture/derive/Cargo.toml" <<'TOML'
+          [package]
+          name = "probe-derive"
+          version = "0.1.0"
+          edition = "2021"
+          [lib]
+          proc-macro = true
+          TOML
+          echo '#[probe_derive::Marker] pub struct Probe; pub fn value() -> u32 { 42 }' > "$root/fixture/src/lib.rs"
+          echo 'extern crate proc_macro; #[proc_macro_attribute] pub fn Marker(_: proc_macro::TokenStream, item: proc_macro::TokenStream) -> proc_macro::TokenStream { item }' > "$root/fixture/derive/src/lib.rs"
+          cd "$root/fixture"
+          cargo generate-lockfile --offline
+          original_path="$PATH"
+          for version in 1.18.0 1.24.0; do
+            case "$version" in
+              1.18.0) checksum=70ab23933b3745205125174120bd930c0116c1ef3ac38786122e5651636b9aea ;;
+              1.24.0) checksum=60c646b7ce5ae9cfdb67b1565a4ec81ec3a07290f1e7000a026a6db7fa247440 ;;
+            esac
+            tools="$root/tools-$version"
+            mkdir -p "$tools/shim"
+            curl --retry 3 -fsSL "https://github.com/jdx/mr-boxington/releases/download/v$version/mbx-aarch64-apple-darwin.tar.gz" -o "$tools/archive.tar.gz"
+            echo "$checksum  $tools/archive.tar.gz" | shasum -a 256 -c -
+            tar -xzf "$tools/archive.tar.gz" -C "$tools" mbx
+            ln -s "$tools/mbx" "$tools/shim/cargo"
+            export PATH="$tools/shim:$tools:$original_path"
+            export MBX_CACHE_DIR="$root/cas-$version"
+            for round in cold warm; do
+              export CARGO_TARGET_DIR="$root/target-$version-$round"
+              test ! -e "$CARGO_TARGET_DIR"
+              export MBX_STATS_REPORT="$root/evidence/$version-$round-stats.json"
+              export MBX_BYPASS_LOG="$root/evidence/$version-$round-bypass.jsonl"
+              "$tools/mbx" ndk -t arm64-v8a build --release --locked -vv > "$root/evidence/$version-$round.log" 2>&1
+              cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/libandroid_cache_probe.rlib" "$root/evidence/$version-$round.rlib"
+            done
+          done
+          cp Cargo.toml Cargo.lock "$root/evidence/"
+          rustc -Vv > "$root/evidence/toolchain.txt"
+          python3 - <<'PYCODE'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'android-adapter/evidence'
+          summary = {}
+          for path in root.glob('*-stats.json'):
+              stats = json.loads(path.read_text())
+              summary[path.stem] = {key: stats[key] for key in ['hits', 'misses', 'bypasses', 'restored_output_files', 'downloaded_bytes', 'remote_failures']}
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2))
+          print(json.dumps(summary, indent=2))
+          assert summary['1.24.0-warm-stats']['hits'] > 0
+          assert summary['1.24.0-warm-stats']['restored_output_files'] > 0
+          PYCODE
+      - name: Preserve compiler arguments and native artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-adapter-diagnosis
+          path: ${{ runner.temp }}/android-adapter/evidence/
+          if-no-files-found: warn
