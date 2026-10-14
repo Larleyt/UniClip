@@ -1,0 +1,230 @@
+# Publish flow: consumes the artifacts produced by build-android + build-ios in
+# the same run and does all the publishing:
+#   - testflight        upload the iOS .ipa to App Store Connect (TestFlight)
+#   - github-release     publish the Android APKs to a GitHub Release
+#   - android-release    upload Android APKs to R2 and register with FlareRelease
+#   - mirror-android-gitcode  optional verified GitCode copy of the same APK
+#
+# Called by release.yml only after validation, the selected builds, and tag
+# creation. `platforms` limits publishing to what was built: an Android-only
+# release skips TestFlight, an iOS-only release skips the APK destinations and
+# publishes a GitHub Release without assets that does not become "latest".
+
+name: publish
+
+permissions:
+  contents: write
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        description: 'Validated release tag created by the calling workflow'
+        required: true
+        type: string
+      platforms:
+        description: 'Platforms this release ships: both, android, or ios'
+        required: false
+        default: both
+        type: string
+
+jobs:
+  testflight:
+    name: Upload to TestFlight
+    if: ${{ inputs.platforms != 'android' }}
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag_name }}
+
+      - name: Select latest Xcode 26
+        run: |
+          XCODE_APP="$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+          sudo xcode-select -s "$XCODE_APP"
+
+      - name: Download IPA artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ios-ipa
+          path: ios-ipa
+
+      - name: Write App Store Connect API key
+        env:
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo -n "$ASC_API_KEY_P8" | base64 --decode \
+            > ~/".appstoreconnect/private_keys/AuthKey_${ASC_API_KEY_ID}.p8"
+
+      - name: Upload to App Store Connect
+        env:
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+        run: |
+          IPA=$(ls ios-ipa/*.ipa | head -1)
+          echo "Uploading $IPA to App Store Connect..."
+          xcrun altool --upload-app --type ios --file "$IPA" \
+            --apiKey "$ASC_API_KEY_ID" --apiIssuer "$ASC_API_ISSUER_ID"
+
+      - name: Set TestFlight "What to Test" (iOS notes)
+        continue-on-error: true
+        env:
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+        run: |
+          node scripts/release-notes.mjs
+          BUNDLE_ID=$(node -e "process.stdout.write(require('./app.json').expo.ios.bundleIdentifier)")
+          BUILD_NUMBER=$(node -e "process.stdout.write(String(require('./app.json').expo.ios.buildNumber))")
+          echo "Setting What to Test for $BUNDLE_ID build $BUILD_NUMBER"
+          ruby scripts/asc_whats_to_test.rb \
+            "$ASC_API_KEY_ID" "$ASC_API_ISSUER_ID" \
+            ~/".appstoreconnect/private_keys/AuthKey_${ASC_API_KEY_ID}.p8" \
+            "$BUNDLE_ID" "$BUILD_NUMBER" \
+            release-notes-testflight.txt release-notes-testflight.en.txt
+
+      - name: Clean up API key
+        if: always()
+        run: rm -f ~/.appstoreconnect/private_keys/AuthKey_*.p8
+
+  github-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag_name }}
+
+      - name: Generate per-platform release notes
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          node scripts/release-notes.mjs --platform "$PLATFORMS"
+          cat release-notes-github.md
+
+      - name: Download APK artifacts
+        if: ${{ inputs.platforms != 'ios' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: apk-arm64-v8a
+          path: apk/
+
+      - name: Publish Release
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          tag: ${{ inputs.tag_name }}
+          prerelease: ${{ contains(inputs.tag_name, '-alpha.') || contains(inputs.tag_name, '-beta') }}
+          makeLatest: ${{ inputs.platforms == 'ios' && 'false' || 'legacy' }}
+          bodyFile: release-notes-github.md
+          artifacts: ${{ inputs.platforms != 'ios' && 'apk/*.apk' || '' }}
+
+      # GITHUB_TOKEN publication does not emit another workflow's release event.
+      # repository_dispatch explicitly notifies the lifecycle on all platforms/channels.
+      - name: Request issue release verification
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag_name }}
+        run: |
+          gh api --method POST "repos/${{ github.repository }}/dispatches" \
+            -f "event_type=issue-lifecycle-release" \
+            -f "client_payload[tag_name]=${RELEASE_TAG}"
+
+  # APKs remain immutable R2 objects. FlareRelease owns mutable channel state;
+  # registration creates a Ready release and never promotes a channel.
+  android-release:
+    name: Register Android release
+    if: ${{ inputs.platforms != 'ios' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag_name }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: apk-arm64-v8a
+          path: apk/
+
+      - name: Generate versioned changelogs
+        run: node scripts/release-notes.mjs
+
+      - name: Assemble Android update manifest
+        run: |
+          MARKETING_VERSION=$(node -p "require('./app.json').expo.version")
+          node scripts/assemble-android-manifest.mjs \
+            --tag "${{ inputs.tag_name }}" \
+            --marketing-version "$MARKETING_VERSION" \
+            --prerelease "${{ contains(inputs.tag_name, '-alpha.') || contains(inputs.tag_name, '-beta') }}" \
+            --apk-dir apk \
+            --changelog-dir changelogs \
+            --out-dir manifests
+
+      - name: Install locked release tools without secrets
+        run: npm ci --ignore-scripts --prefix scripts/release-tools
+
+      - name: Upload APKs to R2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          TAG="${{ inputs.tag_name }}"
+
+          for file in apk/*.apk; do
+            filename=$(basename "$file")
+            echo "Uploading ${filename} to R2..."
+            scripts/release-tools/node_modules/.bin/wrangler r2 object put \
+              "uniclipboard-releases/android/artifacts/${TAG}/${filename}" \
+              --file "$file" \
+              --remote
+          done
+
+      - name: Build FlareRelease registration
+        run: |
+          MANIFEST=$(find manifests -name '*.json' -print -quit)
+          node scripts/build-flare-release-registration.mjs \
+            --manifest "$MANIFEST" \
+            --apk-dir apk \
+            --source "github-actions:${{ github.repository }}:${{ github.run_id }}" \
+            --output flare-release/registration.json
+
+      - name: Register release with FlareRelease
+        env:
+          FLARE_RELEASE_ACCESS_CLIENT_ID: ${{ secrets.FLARE_RELEASE_ACCESS_CLIENT_ID }}
+          FLARE_RELEASE_ACCESS_CLIENT_SECRET: ${{ secrets.FLARE_RELEASE_ACCESS_CLIENT_SECRET }}
+        run: |
+          : "${FLARE_RELEASE_ACCESS_CLIENT_ID:?FLARE_RELEASE_ACCESS_CLIENT_ID organization secret is unavailable to this repository}"
+          : "${FLARE_RELEASE_ACCESS_CLIENT_SECRET:?FLARE_RELEASE_ACCESS_CLIENT_SECRET organization secret is unavailable to this repository}"
+          curl --fail-with-body --silent --show-error \
+            --retry 3 \
+            --retry-all-errors \
+            --header "CF-Access-Client-Id: ${FLARE_RELEASE_ACCESS_CLIENT_ID}" \
+            --header "CF-Access-Client-Secret: ${FLARE_RELEASE_ACCESS_CLIENT_SECRET}" \
+            --header "Content-Type: application/json" \
+            --data-binary @flare-release/registration.json \
+            "https://release-admin.uniclipboard.app/api/releases/register" \
+            --output flare-release/response.json
+          jq -e '.data.status == "ready"' flare-release/response.json
+
+  # Optional mirror for users in mainland China. It copies the same artifact
+  # after FlareRelease registered the release, and never fails the release.
+  mirror-android-gitcode:
+    name: Mirror Android APK to GitCode
+    needs: android-release
+    if: ${{ inputs.platforms != 'ios' }}
+    uses: ./.github/workflows/mirror-android-gitcode.yml
+    with:
+      tag_name: ${{ inputs.tag_name }}
+      non_blocking: true
+    secrets: inherit

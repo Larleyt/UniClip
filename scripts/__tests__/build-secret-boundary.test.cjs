@@ -5,7 +5,7 @@ const { test } = require('node:test');
 const YAML = require('yaml');
 
 const root = path.resolve(__dirname, '../..');
-const names = ['adopt-engine-release', 'android-build', 'build-ios', 'ios-build-check', 'release'];
+const names = ['adopt-engine-release', 'android-build', 'build-ios', 'ios-build-check', 'release', 'publish'];
 
 for (const name of names) {
   test(`${name}: dependency installation has no secrets or automatic scripts`, () => {

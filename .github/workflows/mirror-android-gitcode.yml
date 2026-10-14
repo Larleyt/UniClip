@@ -13,7 +13,7 @@
 # SSH session (nothing is stored there); no code does, so the key cannot be used
 # to run anything else. The host refuses a script that differs from this commit's.
 #
-# - Called by release.yml after the FlareRelease registration, non-blocking:
+# - Called by publish.yml after the FlareRelease registration, non-blocking:
 #   a missing configuration or a failed mirror produces a warning annotation
 #   and a job summary, never a failed release.
 # - Run by hand (workflow_dispatch) to retry or to mirror an older tag. It
@@ -31,7 +31,7 @@
 #   variable GITCODE_OWNER, GITCODE_REPO          the mirror repository (must exist, with a commit on its default branch)
 #   variable GITCODE_API_BASE (optional)          default https://api.gitcode.com/api/v5
 #   variable GITCODE_TARGET_COMMITISH (optional)  branch for new release tags, default main
-#   secret   FLARE_RELEASE_ACCESS_CLIENT_ID/SECRET already used by release.yml
+#   secret   FLARE_RELEASE_ACCESS_CLIENT_ID/SECRET already used by publish.yml
 
 name: mirror-android-gitcode
 

@@ -107,6 +107,6 @@ console.log('  2. Commit and push the release metadata:');
 console.log(`       git add app.json CHANGES.md CHANGES.en.md changelogs`);
 console.log(`       git commit -m "chore(release): ${tag.slice(1)}"`);
 console.log(`       git push origin main`);
-console.log('  3. In GitHub Actions, run "build" on main with publish_release enabled and');
+console.log('  3. In GitHub Actions, run "release" on main with');
 console.log('     platforms set to both, android, or ios.');
-console.log(`     CI will create ${tag} only after every check and the selected builds pass.`);
+console.log(`     CI will create ${tag} only after release preparation and the selected builds pass.`);

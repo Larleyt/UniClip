@@ -60,7 +60,7 @@ build. Add device/platform and test details in a separate comment when useful.
 
 ## Release integration and limits
 
-`release.yml` dispatches `issue-lifecycle-release` immediately after successful
+`publish.yml` dispatches `issue-lifecycle-release` immediately after successful
 GitHub publication for every platform selection and channel. This is necessary
 because publication using `GITHUB_TOKEN` does not trigger another workflow's
 `release` event. Manually published releases also use `release: published`.
