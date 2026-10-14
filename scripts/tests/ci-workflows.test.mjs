@@ -13,8 +13,8 @@ const nativeNames = ['android-build', 'ios-build-check'];
 // Evaluate the small boolean expressions used by these workflows against an
 // event/result matrix. No builds, actions, credentials or live API calls run.
 function evaluate(expression, { needs = {}, github = {}, inputs = {}, steps = {} } = {}) {
-  if (typeof expression !== 'string' || !expression.startsWith('${{')) return expression;
-  const source = expression.slice(3, -2).trim().replace(/needs\.([\w-]+)/g, (_, name) => `needs[${JSON.stringify(name)}]`);
+  if (typeof expression !== 'string' || (!expression.startsWith('${{') && !expression.startsWith('always()'))) return expression;
+  const source = (expression.startsWith('${{') ? expression.slice(3, -2) : expression).trim().replace(/needs\.([\w-]+)/g, (_, name) => `needs[${JSON.stringify(name)}]`);
   return new Function('needs', 'github', 'inputs', 'steps', 'always', `return (${source});`)(needs, github, inputs, steps, () => true);
 }
 const successful = (nativeRequired = 'false') => ({
@@ -111,10 +111,13 @@ test('stable native job names complete cheaply on Ubuntu, retaining native work 
         assert.equal(evaluate(job['runs-on'], context), name === 'ios-build-check' && build_required && validation_passed ? 'macos-26' : 'ubuntu-latest');
         assert.equal(job.steps[0].name, 'Validate build decision');
         assert.equal(job.steps[0].if, undefined);
-        for (const step of job.steps.slice(1)) assert.equal(evaluate(step.if, context), build_required && validation_passed, step.name);
+        for (const step of job.steps.slice(1)) {
+          const expected = step.name === 'Retain MBX compiler evidence' ? true : build_required && validation_passed;
+          assert.equal(evaluate(step.if, context), expected, step.name);
+        }
       }
     }
-    const cache = job.steps.find((step) => step.name === 'Restore Engine build cache');
+    const cache = job.steps.find((step) => step.name === 'Restore local Engine MBX actions');
     assert.equal(evaluate(cache.if, { inputs: { build_required: true, validation_passed: true }, steps: { engine: { outputs: { source: 'release' } } } }), false);
   }
 });
