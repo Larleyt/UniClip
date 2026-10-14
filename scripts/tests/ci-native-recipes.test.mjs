@@ -19,8 +19,8 @@ for (const name of ['android-build', 'ios-build-check']) {
       job['runs-on'] = name === 'android-build' ? 'ubuntu-latest' : 'macos-26';
       job.steps.shift();
       for (const step of job.steps) {
-        if (step.name === 'Restore Engine build cache') step.if = "steps.engine.outputs.source == 'commit'";
-        else delete step.if;
+        if (step.name === 'Restore local Engine MBX actions') step.if = "steps.engine.outputs.source == 'commit'";
+        else if (step.name !== 'Retain MBX compiler evidence') delete step.if;
       }
     });
     assert.equal(sameNativeRecipe(path(name), unwrapped, current), true);
