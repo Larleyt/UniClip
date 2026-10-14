@@ -1,3 +1,23 @@
+v2.1.0.190-alpha.1
+
+### Common
+
+- New: Space settings show per-device group update delivery status
+- Improvement: Update the sync core to a revision with managed connections
+- Fix: Long text was shown and synced as only its first 200 characters in details, sync and send
+
+### iOS
+
+- Fix: Sync core lifecycle handling when the app is suspended or resumed in the background
+- Fix: Sync core installation recovery
+
+### Android
+
+- New: Local power and background activity metrics
+- Improvement: LAN sync keeps a single receive subscription in the background, works with every desktop, and sends uploads only once
+- Fix: Unstable background clipboard sync and service lifecycle
+- Fix: The maximum history entries setting could not be edited, read or applied
+
 v2.1.0.189
 
 ### Common
