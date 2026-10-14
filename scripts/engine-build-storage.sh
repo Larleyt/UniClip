@@ -38,5 +38,21 @@ uc_engine_run_build() (
   if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app/Contents/Developer ]]; then
     export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
   fi
+  local credentials=0 name
+  for name in BUILD_CACHE_R2_ENDPOINT BUILD_CACHE_R2_ACCESS_KEY_ID BUILD_CACHE_R2_SECRET_ACCESS_KEY; do
+    [[ -z "${!name:-}" ]] || credentials=$((credentials + 1))
+  done
+  if [[ $credentials != 0 && $credentials != 3 ]]; then
+    echo 'Incomplete MBX R2 credentials' >&2
+    exit 1
+  fi
+  if [[ $credentials == 3 ]]; then
+    [[ "$BUILD_CACHE_R2_ENDPOINT" == https://* ]] || { echo 'MBX R2 endpoint must use HTTPS' >&2; exit 1; }
+    # Mobile consumes the trusted Engine cache; it never publishes to it.
+    export MBX_REMOTE_MODE=read-only
+    local build_root
+    build_root="$(cd "$(dirname "$1")/../../.." && pwd)"
+    bash "$build_root/scripts/build-cache/prepare-ci-network.sh"
+  fi
   "$@"
 )

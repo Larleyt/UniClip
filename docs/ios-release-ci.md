@@ -132,3 +132,5 @@ App Store Connect app record. The distinction is by channel:
 - **Link errors compiling `UcEngineModule.swift`** — the prepared engine artifact
   and the committed wrapper are out of sync; re-run preparation and verification,
   then align the wrapper if the engine interface changed.
+
+Engine commit pin 的源码构建与 MBX/R2 权限边界见 [Engine 编译缓存](engine-compiler-cache.md)。
