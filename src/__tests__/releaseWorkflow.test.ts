@@ -102,7 +102,7 @@ describe('validated release workflow', () => {
     expect(eslintConfig).not.toContain('prettier');
   });
 
-  it('gates both platform builds on code style and unit tests', () => {
+  it('gates non-release platform builds on code style and unit tests', () => {
     const mainJobs = parse(buildWorkflow).jobs;
     const prJobs = parse(pullRequestWorkflow).jobs;
     expect(mainJobs['android-build'].needs).toEqual(
@@ -114,12 +114,12 @@ describe('validated release workflow', () => {
     );
   });
 
-  it('creates the derived tag only after validation, checks, and both builds', () => {
+  it('creates the derived tag only after release preparation and selected builds', () => {
     expect(buildWorkflow).toContain('npm run release:validate');
     expect(packageScripts['release:validate']).toContain('release-notes.mjs --check');
     expect(buildWorkflow).toContain('bash scripts/create-release-tag.sh --check');
     expect(buildWorkflow).toMatch(
-      /create-release-tag:[\s\S]*needs:\s*\[prepare, code-style, unit-tests, android-build, ios-build\]/
+      /create-release-tag:[\s\S]*needs:\s*\[prepare, release-android-build, release-ios-build\]/
     );
     expect(buildWorkflow).toContain('bash scripts/create-release-tag.sh');
   });
@@ -168,18 +168,18 @@ describe('validated release workflow', () => {
     expect(buildWorkflow).toMatch(
       /platforms:[\s\S]*?type: choice[\s\S]*?- both\s*\n\s*- android\s*\n\s*- ios/
     );
-    expect(parse(buildWorkflow).jobs['android-build'].if).toBe(
-      "${{ always() && (github.event_name != 'workflow_dispatch' || inputs.platforms != 'ios') }}"
+    expect(parse(buildWorkflow).jobs['release-android-build'].if).toBe(
+      "${{ github.event_name == 'workflow_dispatch' && inputs.publish_release && inputs.platforms != 'ios' }}"
     );
-    expect(buildWorkflow).toContain(
-      "if: ${{ github.event_name == 'workflow_dispatch' && inputs.platforms != 'android' }}"
+    expect(parse(buildWorkflow).jobs['release-ios-build'].if).toBe(
+      "${{ github.event_name == 'workflow_dispatch' && inputs.publish_release && inputs.platforms != 'android' }}"
     );
     // A deselected platform is skipped, never a reason to tag a failed build.
     expect(buildWorkflow).toContain(
-      "(needs.android-build.result == 'success' || (inputs.platforms == 'ios' && needs.android-build.result == 'skipped'))"
+      "(needs.release-android-build.result == 'success' || (inputs.platforms == 'ios' && needs.release-android-build.result == 'skipped'))"
     );
     expect(buildWorkflow).toContain(
-      "(needs.ios-build.result == 'success' || (inputs.platforms == 'android' && needs.ios-build.result == 'skipped'))"
+      "(needs.release-ios-build.result == 'success' || (inputs.platforms == 'android' && needs.release-ios-build.result == 'skipped'))"
     );
     expect(buildWorkflow).toContain('platforms: ${{ inputs.platforms }}');
     expect(releaseWorkflow).toMatch(/testflight:[\s\S]*?if: \$\{\{ inputs\.platforms != 'android' \}\}/);
