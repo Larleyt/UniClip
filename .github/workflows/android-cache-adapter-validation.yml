@@ -64,6 +64,16 @@ jobs:
           echo 'extern crate proc_macro; #[proc_macro_attribute] pub fn Marker(_: proc_macro::TokenStream, item: proc_macro::TokenStream) -> proc_macro::TokenStream { item }' > "$root/fixture/derive/src/lib.rs"
           cd "$root/fixture"
           cargo generate-lockfile --offline
+          mkdir -p "$root/plain/src"
+          python3 - <<'PYCODE'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'android-adapter'
+          manifest = (root / 'fixture/Cargo.toml').read_text().replace('[dependencies]\nprobe-derive = { path = "derive" }\n', '').replace('android-cache-probe', 'android-plain-probe')
+          (root / 'plain/Cargo.toml').write_text(manifest)
+          (root / 'plain/src/lib.rs').write_text('pub fn value() -> u32 { 42 }\n')
+          PYCODE
+          (cd "$root/plain" && cargo generate-lockfile --offline)
           original_path="$PATH"
           for version in 1.18.0 1.24.0; do
             case "$version" in
@@ -78,15 +88,20 @@ jobs:
             ln -s "$tools/mbx" "$tools/shim/cargo"
             export PATH="$tools/shim:$tools:$original_path"
             export MBX_CACHE_DIR="$root/cas-$version"
-            for round in cold warm; do
-              export CARGO_TARGET_DIR="$root/target-$version-$round"
-              test ! -e "$CARGO_TARGET_DIR"
-              export MBX_STATS_REPORT="$root/evidence/$version-$round-stats.json"
-              export MBX_BYPASS_LOG="$root/evidence/$version-$round-bypass.jsonl"
-              "$tools/mbx" ndk -t arm64-v8a build --release --locked -vv > "$root/evidence/$version-$round.log" 2>&1
-              cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/libandroid_cache_probe.rlib" "$root/evidence/$version-$round.rlib"
+            for scenario in fixture plain; do
+              cd "$root/$scenario"
+              export MBX_CACHE_DIR="$root/cas-$version-$scenario"
+              for round in cold warm; do
+                export CARGO_TARGET_DIR="$root/target-$version-$scenario-$round"
+                test ! -e "$CARGO_TARGET_DIR"
+                export MBX_STATS_REPORT="$root/evidence/$version-$scenario-$round-stats.json"
+                export MBX_BYPASS_LOG="$root/evidence/$version-$scenario-$round-bypass.txt"
+                "$tools/mbx" ndk -t arm64-v8a build --release --locked -vv > "$root/evidence/$version-$scenario-$round.log" 2>&1
+                cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/"*.rlib "$root/evidence/$version-$scenario-$round.rlib"
+              done
             done
           done
+          cd "$root/fixture"
           cp Cargo.toml Cargo.lock "$root/evidence/"
           rustc -Vv > "$root/evidence/toolchain.txt"
           python3 - <<'PYCODE'
@@ -99,8 +114,8 @@ jobs:
               summary[path.stem] = {key: stats[key] for key in ['hits', 'misses', 'bypasses', 'restored_output_files', 'downloaded_bytes', 'remote_failures']}
           (root / 'summary.json').write_text(json.dumps(summary, indent=2))
           print(json.dumps(summary, indent=2))
-          assert summary['1.24.0-warm-stats']['hits'] > 0
-          assert summary['1.24.0-warm-stats']['restored_output_files'] > 0
+          assert summary['1.24.0-plain-warm-stats']['hits'] > 0
+          assert summary['1.24.0-plain-warm-stats']['restored_output_files'] > 0
           PYCODE
       - name: Preserve compiler arguments and native artifacts
         if: always()
