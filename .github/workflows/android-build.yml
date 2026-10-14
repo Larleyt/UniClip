@@ -2,6 +2,15 @@ name: android-build
 
 on:
   workflow_call:
+    secrets:
+      UC_POSTHOG_PROJECT_KEY:
+        required: false
+      BUILD_CACHE_R2_ENDPOINT:
+        required: false
+      BUILD_CACHE_R2_ACCESS_KEY_ID:
+        required: false
+      BUILD_CACHE_R2_SECRET_ACCESS_KEY:
+        required: false
     inputs:
       build_required:
         description: 'Compile the app; false only for explicitly classified validation-only changes'

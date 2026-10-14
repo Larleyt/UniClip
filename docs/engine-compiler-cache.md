@@ -13,3 +13,5 @@ Prepare unified engine core 步骤接收可选的仓库 secrets：`BUILD_CACHE_R
 同一 bucket/namespace 允许兼容动作共享，不能把 iOS、Android 和 Desktop 全部产物互换。编译器、target、源码、features、profile、依赖内容、编译参数、发现的环境值、受支持链接器/SDK 都影响分键。保持 Engine 默认路径语义，不启用 `share_workspace_root`。
 
 本地小型真实 Engine 内容哈希消费者验证了 Mobile 构建调用函数和 Engine MBX 入口、独立 target 的恢复及输入变化后的程序输出；完整 AAR/XCFramework 和真实 R2 下载命中仍需 CI 验证。证据要求是独立 CAS 的消费者下载字节大于零、上传为零、远端错误为零，并实际运行恢复出的产物；单凭工作流通过或 target 复用不够。
+
+Android 与 iOS 检查的 reusable workflow 声明三个可选缓存 secret，build/build-pr/release 调用方只显式转发这三个值；不转发签名或发布凭据。fork 和未配置凭据仍使用本地 CAS。
