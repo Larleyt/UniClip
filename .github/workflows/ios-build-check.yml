@@ -2,6 +2,15 @@ name: ios-build-check
 
 on:
   workflow_call:
+    secrets:
+      UC_POSTHOG_PROJECT_KEY:
+        required: false
+      BUILD_CACHE_R2_ENDPOINT:
+        required: false
+      BUILD_CACHE_R2_ACCESS_KEY_ID:
+        required: false
+      BUILD_CACHE_R2_SECRET_ACCESS_KEY:
+        required: false
     inputs:
       build_required:
         description: 'Compile the app; false only for explicitly classified validation-only changes'
@@ -75,20 +84,34 @@ jobs:
         id: engine
         run: echo "source=$(node -p "require('./modules/uc-engine/core-source.json').artifactSource || 'release'")" >> "$GITHUB_OUTPUT"
 
-      # Commit pins compile Engine from source; keep the cargo target between runs.
-      - name: Restore Engine build cache
+      # Commit pins use Engine MBX actions; never restore an entire target tree.
+      - name: Restore local Engine MBX actions
         if: ${{ inputs.build_required && inputs.validation_passed && steps.engine.outputs.source == 'commit' }}
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/engine-target
-          key: engine-target-${{ runner.os }}-ios-${{ hashFiles('modules/uc-engine/core-source.json') }}
-          restore-keys: engine-target-${{ runner.os }}-ios-
+          path: ${{ runner.temp }}/engine-mbx-cache
+          key: engine-mbx-v1-${{ runner.os }}-${{ runner.arch }}-ios-${{ github.ref }}-${{ github.sha }}
+          restore-keys: engine-mbx-v1-${{ runner.os }}-${{ runner.arch }}-ios-${{ github.ref }}-
 
       - name: Prepare unified engine core
         if: ${{ inputs.build_required && inputs.validation_passed }}
         env:
           UC_ENGINE_LOCAL_TARGET_DIR: ${{ steps.engine.outputs.source == 'commit' && format('{0}/engine-target', runner.temp) || '' }}
+          MBX_CACHE_DIR: ${{ runner.temp }}/engine-mbx-cache
+          MBX_GC_MAX_SIZE: 2GiB
+          UC_ENGINE_MBX_STATS_DIR: ${{ runner.temp }}/mbx-evidence
+          BUILD_CACHE_R2_ENDPOINT: ${{ secrets.BUILD_CACHE_R2_ENDPOINT }}
+          BUILD_CACHE_R2_ACCESS_KEY_ID: ${{ secrets.BUILD_CACHE_R2_ACCESS_KEY_ID }}
+          BUILD_CACHE_R2_SECRET_ACCESS_KEY: ${{ secrets.BUILD_CACHE_R2_SECRET_ACCESS_KEY }}
         run: npm run core:prepare -- --platform ios
+
+      - name: Retain MBX compiler evidence
+        if: always() && steps.engine.outputs.source == 'commit'
+        uses: actions/upload-artifact@v7
+        with:
+          name: mbx-ios-build-check-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ runner.temp }}/mbx-evidence/
+          if-no-files-found: ignore
 
       - name: Verify unified engine core
         if: ${{ inputs.build_required && inputs.validation_passed }}

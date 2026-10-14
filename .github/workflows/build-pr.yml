@@ -17,6 +17,10 @@ jobs:
     if: ${{ always() }}
     needs: [changes, code-style, unit-tests]
     uses: ./.github/workflows/android-build.yml
+    secrets:
+      BUILD_CACHE_R2_ENDPOINT: ${{ secrets.BUILD_CACHE_R2_ENDPOINT }}
+      BUILD_CACHE_R2_ACCESS_KEY_ID: ${{ secrets.BUILD_CACHE_R2_ACCESS_KEY_ID }}
+      BUILD_CACHE_R2_SECRET_ACCESS_KEY: ${{ secrets.BUILD_CACHE_R2_SECRET_ACCESS_KEY }}
     with:
       build_required: ${{ needs.changes.outputs.native_required != 'false' }}
       validation_passed: ${{ needs.changes.result == 'success' && needs.code-style.result == 'success' && needs.unit-tests.result == 'success' }}
@@ -26,6 +30,10 @@ jobs:
     if: ${{ always() }}
     needs: [changes, code-style, unit-tests]
     uses: ./.github/workflows/ios-build-check.yml
+    secrets:
+      BUILD_CACHE_R2_ENDPOINT: ${{ secrets.BUILD_CACHE_R2_ENDPOINT }}
+      BUILD_CACHE_R2_ACCESS_KEY_ID: ${{ secrets.BUILD_CACHE_R2_ACCESS_KEY_ID }}
+      BUILD_CACHE_R2_SECRET_ACCESS_KEY: ${{ secrets.BUILD_CACHE_R2_SECRET_ACCESS_KEY }}
     with:
       build_required: ${{ needs.changes.outputs.native_required != 'false' }}
       validation_passed: ${{ needs.changes.result == 'success' && needs.code-style.result == 'success' && needs.unit-tests.result == 'success' }}

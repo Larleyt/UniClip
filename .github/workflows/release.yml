@@ -93,6 +93,10 @@ jobs:
     if: ${{ inputs.platforms != 'ios' }}
     needs: [prepare]
     uses: ./.github/workflows/android-build.yml
+    secrets:
+      BUILD_CACHE_R2_ENDPOINT: ${{ secrets.BUILD_CACHE_R2_ENDPOINT }}
+      BUILD_CACHE_R2_ACCESS_KEY_ID: ${{ secrets.BUILD_CACHE_R2_ACCESS_KEY_ID }}
+      BUILD_CACHE_R2_SECRET_ACCESS_KEY: ${{ secrets.BUILD_CACHE_R2_SECRET_ACCESS_KEY }}
 
   ios-build:
     if: ${{ inputs.platforms != 'android' }}
