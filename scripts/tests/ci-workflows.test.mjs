@@ -29,7 +29,7 @@ test('only main pushes and PRs validate automatically; manual selections remain 
   assert.equal(Object.hasOwn(pr.on, 'push'), false);
   assert.equal(Object.hasOwn(build.on, 'pull_request'), false);
   assert.deepEqual(build.on.workflow_dispatch.inputs.platforms.options, ['both', 'android', 'ios']);
-  for (const key of ['publish_release', 'build_number', 'upload_testflight']) assert.ok(build.on.workflow_dispatch.inputs[key]);
+  for (const key of ['build_number', 'upload_testflight']) assert.ok(build.on.workflow_dispatch.inputs[key]);
   for (const parent of [build, pr]) {
     assert.equal(parent.on.push?.paths, undefined);
     assert.equal(parent.on.push?.['paths-ignore'], undefined);
@@ -142,7 +142,8 @@ test('new tests run alongside existing lifecycle/app tests; no release or signin
   assert.ok(commands.includes('npm run test:e2e:environment'));
   assert.equal(build.jobs['ios-build'].uses, './.github/workflows/build-ios.yml');
   assert.equal(build.jobs['ios-build'].secrets, 'inherit');
-  assert.equal(build.jobs.release.uses, './.github/workflows/release.yml');
-  assert.ok(build.jobs['create-release-tag'].if.includes("needs.android-build.result == 'success'"));
-  assert.ok(build.jobs['create-release-tag'].if.includes("needs.ios-build.result == 'success'"));
+  const release = workflow('release');
+  assert.equal(release.jobs.publish.uses, './.github/workflows/publish.yml');
+  assert.ok(release.jobs['create-release-tag'].if.includes("needs.android-build.result == 'success'"));
+  assert.ok(release.jobs['create-release-tag'].if.includes("needs.ios-build.result == 'success'"));
 });

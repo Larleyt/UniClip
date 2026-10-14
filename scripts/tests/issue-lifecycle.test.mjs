@@ -177,7 +177,7 @@ test('workflow entrypoints execute the tested module', async () => {
 });
 
 test('release wiring dispatches after GitHub publication for every platform and channel', () => {
-  const release = parse(readFileSync(new URL('../../.github/workflows/release.yml', import.meta.url), 'utf8'));
+  const release = parse(readFileSync(new URL('../../.github/workflows/publish.yml', import.meta.url), 'utf8'));
   const steps = release.jobs['github-release'].steps;
   const publish = steps.findIndex((step) => step.uses === 'ncipollo/release-action@v1');
   const dispatch = steps.findIndex((step) => step.name === 'Request issue release verification');

@@ -66,7 +66,7 @@ test('orchestration changes are lightweight while recipe references and manual/r
     assert.equal(sameNativeRecipe(path(name), current, change(current, (v) => { v.jobs['android-build'].with.native_flag = 'new-build-mode'; })), false);
   }
   const current = read('build');
-  for (const name of ['prepare', 'ios-build', 'create-release-tag', 'release']) {
+  for (const name of ['prepare', 'ios-build']) {
     const modified = change(current, (v) => {
       if (v.jobs[name].steps) v.jobs[name].steps[0].run += '\necho changed\n';
       else v.jobs[name].with.new_input = 'changed';
@@ -106,13 +106,13 @@ test('Engine pins and native bindings still require compilation alongside schedu
 
 
 test('release notifications can change without ignoring packaging, artifacts, signing or publisher commands', () => {
-  const current = read('release');
+  const current = read('publish');
   const withoutNotice = change(current, (v) => { v.jobs['github-release'].steps = v.jobs['github-release'].steps.filter((s) => s.name !== 'Request issue release verification'); });
-  assert.equal(sameNativeRecipe(path('release'), withoutNotice, current), true);
+  assert.equal(sameNativeRecipe(path('publish'), withoutNotice, current), true);
   for (const modify of [
     (v) => { v.jobs['github-release'].steps.find((s) => s.name === 'Publish Release').with.artifacts = 'other/*.apk'; },
     (v) => { v.jobs.testflight.steps.at(-1).run += '\necho signing change\n'; },
     (v) => { v.jobs['android-release'].steps.at(-1).run += '\necho publishing change\n'; },
     (v) => { v.jobs['github-release'].steps.at(-1).run += '\necho additional command\n'; },
-  ]) assert.equal(sameNativeRecipe(path('release'), current, change(current, modify)), false);
+  ]) assert.equal(sameNativeRecipe(path('publish'), current, change(current, modify)), false);
 });

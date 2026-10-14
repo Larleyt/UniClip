@@ -39,7 +39,8 @@ const iosBuildCheckPath = join(root, '.github', 'workflows', 'ios-build-check.ym
 const iosBuildCheckWorkflow = existsSync(iosBuildCheckPath)
   ? readFileSync(iosBuildCheckPath, 'utf8')
   : '';
-const releaseWorkflow = readFileSync(join(root, '.github', 'workflows', 'release.yml'), 'utf8');
+const releaseWorkflow = readFileSync(join(root, '.github', 'workflows', 'publish.yml'), 'utf8');
+const releaseEntryWorkflow = readFileSync(join(root, '.github', 'workflows', 'release.yml'), 'utf8');
 const engineAdoptionWorkflowPath = join(root, '.github', 'workflows', 'adopt-engine-release.yml');
 const engineAdoptionWorkflow = existsSync(engineAdoptionWorkflowPath)
   ? readFileSync(engineAdoptionWorkflowPath, 'utf8')
@@ -74,7 +75,8 @@ describe('validated release workflow', () => {
   });
 
   it('offers a full release mode while preserving manual iOS builds', () => {
-    expect(buildWorkflow).toContain('publish_release:');
+    expect(buildWorkflow).not.toContain('publish_release');
+    expect(Object.keys(parse(releaseEntryWorkflow).on)).toEqual(['workflow_dispatch']);
     expect(buildWorkflow).toContain('upload_testflight:');
     expect(buildWorkflow).toContain("github.event_name == 'workflow_dispatch'");
   });
@@ -102,7 +104,7 @@ describe('validated release workflow', () => {
     expect(eslintConfig).not.toContain('prettier');
   });
 
-  it('gates both platform builds on code style and unit tests', () => {
+  it('gates non-release platform builds on code style and unit tests', () => {
     const mainJobs = parse(buildWorkflow).jobs;
     const prJobs = parse(pullRequestWorkflow).jobs;
     expect(mainJobs['android-build'].needs).toEqual(
@@ -114,19 +116,19 @@ describe('validated release workflow', () => {
     );
   });
 
-  it('creates the derived tag only after validation, checks, and both builds', () => {
-    expect(buildWorkflow).toContain('npm run release:validate');
+  it('creates the derived tag only after release preparation and selected builds', () => {
+    expect(releaseEntryWorkflow).toContain('npm run release:validate');
     expect(packageScripts['release:validate']).toContain('release-notes.mjs --check');
-    expect(buildWorkflow).toContain('bash scripts/create-release-tag.sh --check');
-    expect(buildWorkflow).toMatch(
-      /create-release-tag:[\s\S]*needs:\s*\[prepare, code-style, unit-tests, android-build, ios-build\]/
+    expect(releaseEntryWorkflow).toContain('bash scripts/create-release-tag.sh --check');
+    expect(releaseEntryWorkflow).toMatch(
+      /create-release-tag:[\s\S]*needs:\s*\[prepare, android-build, ios-build\]/
     );
-    expect(buildWorkflow).toContain('bash scripts/create-release-tag.sh');
+    expect(releaseEntryWorkflow).toContain('bash scripts/create-release-tag.sh');
   });
 
   it('does not rebuild the retired mobile core during iOS releases', () => {
     expect(packageScripts['release:validate']).not.toContain('validate-uc-core-ref.mjs');
-    expect(buildWorkflow).toContain('npm run release:validate');
+    expect(releaseEntryWorkflow).toContain('npm run release:validate');
     expect(iosBuildWorkflow).not.toContain('rust-core/source-ref');
     expect(iosBuildWorkflow).not.toContain('modules/uc-core');
     expect(iosBuildCheckWorkflow).not.toContain('modules/uc-core');
@@ -165,23 +167,23 @@ describe('validated release workflow', () => {
   });
 
   it('publishes Android-only, iOS-only, or both from one release mode', () => {
-    expect(buildWorkflow).toMatch(
+    expect(releaseEntryWorkflow).toMatch(
       /platforms:[\s\S]*?type: choice[\s\S]*?- both\s*\n\s*- android\s*\n\s*- ios/
     );
-    expect(parse(buildWorkflow).jobs['android-build'].if).toBe(
-      "${{ always() && (github.event_name != 'workflow_dispatch' || inputs.platforms != 'ios') }}"
+    expect(parse(releaseEntryWorkflow).jobs['android-build'].if).toBe(
+      "${{ inputs.platforms != 'ios' }}"
     );
-    expect(buildWorkflow).toContain(
-      "if: ${{ github.event_name == 'workflow_dispatch' && inputs.platforms != 'android' }}"
+    expect(parse(releaseEntryWorkflow).jobs['ios-build'].if).toBe(
+      "${{ inputs.platforms != 'android' }}"
     );
     // A deselected platform is skipped, never a reason to tag a failed build.
-    expect(buildWorkflow).toContain(
+    expect(releaseEntryWorkflow).toContain(
       "(needs.android-build.result == 'success' || (inputs.platforms == 'ios' && needs.android-build.result == 'skipped'))"
     );
-    expect(buildWorkflow).toContain(
+    expect(releaseEntryWorkflow).toContain(
       "(needs.ios-build.result == 'success' || (inputs.platforms == 'android' && needs.ios-build.result == 'skipped'))"
     );
-    expect(buildWorkflow).toContain('platforms: ${{ inputs.platforms }}');
+    expect(releaseEntryWorkflow).toContain('platforms: ${{ inputs.platforms }}');
     expect(releaseWorkflow).toMatch(/testflight:[\s\S]*?if: \$\{\{ inputs\.platforms != 'android' \}\}/);
     expect(releaseWorkflow).toMatch(
       /android-release:[\s\S]*?if: \$\{\{ inputs\.platforms != 'ios' \}\}/
@@ -192,7 +194,7 @@ describe('validated release workflow', () => {
 
   it('refuses any published build number an earlier artifact already consumed', () => {
     expect(packageScripts['release:check-build']).toBe('node scripts/check-build-number.mjs');
-    expect(buildWorkflow).toMatch(
+    expect(releaseEntryWorkflow).toMatch(
       /name: Require an unused build number[\s\S]*?asc_latest_build\.rb[\s\S]*?check-build-number\.mjs --require-origin --ignore-tag "\$TAG" --asc-max "\$ASC_MAX"/
     );
     expect(iosBuildWorkflow).toMatch(
@@ -206,13 +208,15 @@ describe('validated release workflow', () => {
 
   it('serializes TestFlight dev uploads with releases because both consume numbers', () => {
     expect(buildWorkflow).toContain(
-      "(inputs.publish_release || inputs.upload_testflight) && 'uniclip-release'"
+      "inputs.upload_testflight && 'uniclip-release'"
     );
   });
 
   it('serializes full releases without cancelling one already in progress', () => {
-    expect(buildWorkflow).toContain('uniclip-release');
-    expect(buildWorkflow).toContain('cancel-in-progress: false');
+    expect(parse(releaseEntryWorkflow).concurrency).toEqual({
+      group: 'uniclip-release',
+      'cancel-in-progress': false,
+    });
   });
 
   it('publishes with an explicit tag instead of the triggering ref', () => {
