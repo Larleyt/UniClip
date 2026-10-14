@@ -134,12 +134,13 @@ jobs:
         run: rm -f "$RUNNER_TEMP/AuthKey.p8"
 
   code-style:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.publish_release }}
     needs: [prepare]
     uses: ./.github/workflows/code-style.yml
 
   android-build:
     needs: [changes, prepare, code-style, unit-tests]
-    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.platforms != 'ios') }}
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || (!inputs.publish_release && inputs.platforms != 'ios')) }}
     uses: ./.github/workflows/android-build.yml
     with:
       build_required: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.native_required != 'false' }}
@@ -147,6 +148,7 @@ jobs:
       build_reason: ${{ github.event_name == 'workflow_dispatch' && 'Manual build requested.' || needs.changes.outputs.reason }}
 
   unit-tests:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.publish_release }}
     needs: [prepare]
     uses: ./.github/workflows/test.yml
 
@@ -162,7 +164,7 @@ jobs:
   # Manual runs build iOS. A dev build may optionally upload directly to
   # TestFlight; a full release leaves uploading to release.yml after tagging.
   ios-build:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.platforms != 'android' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish_release && inputs.platforms != 'android' }}
     needs: [prepare, code-style, unit-tests]
     uses: ./.github/workflows/build-ios.yml
     secrets: inherit
@@ -170,17 +172,29 @@ jobs:
       build_number: ${{ inputs.build_number }}
       upload_testflight: ${{ !inputs.publish_release && inputs.upload_testflight }}
 
+  # Releases use the same build recipes without the CI quality gates. Keep
+  # separate callers so push and manual dev builds retain their existing gates.
+  release-android-build:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release && inputs.platforms != 'ios' }}
+    needs: [prepare]
+    uses: ./.github/workflows/android-build.yml
+
+  release-ios-build:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release && inputs.platforms != 'android' }}
+    needs: [prepare]
+    uses: ./.github/workflows/build-ios.yml
+    secrets: inherit
+
   # A platform left out of the release is skipped rather than successful, so
   # these gates spell out which build results count as ready.
   create-release-tag:
     name: Create release tag
     if: >-
       ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.publish_release &&
-      needs.prepare.result == 'success' && needs.code-style.result == 'success' &&
-      needs.unit-tests.result == 'success' &&
-      (needs.android-build.result == 'success' || (inputs.platforms == 'ios' && needs.android-build.result == 'skipped')) &&
-      (needs.ios-build.result == 'success' || (inputs.platforms == 'android' && needs.ios-build.result == 'skipped')) }}
-    needs: [prepare, code-style, unit-tests, android-build, ios-build]
+      needs.prepare.result == 'success' &&
+      (needs.release-android-build.result == 'success' || (inputs.platforms == 'ios' && needs.release-android-build.result == 'skipped')) &&
+      (needs.release-ios-build.result == 'success' || (inputs.platforms == 'android' && needs.release-ios-build.result == 'skipped')) }}
+    needs: [prepare, release-android-build, release-ios-build]
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.prepare.outputs.tag }}
@@ -195,7 +209,7 @@ jobs:
 
   release:
     if: ${{ !cancelled() && needs.create-release-tag.result == 'success' }}
-    needs: [prepare, code-style, unit-tests, android-build, ios-build, create-release-tag]
+    needs: [prepare, release-android-build, release-ios-build, create-release-tag]
     uses: ./.github/workflows/release.yml
     secrets: inherit
     with:

@@ -143,6 +143,6 @@ test('new tests run alongside existing lifecycle/app tests; no release or signin
   assert.equal(build.jobs['ios-build'].uses, './.github/workflows/build-ios.yml');
   assert.equal(build.jobs['ios-build'].secrets, 'inherit');
   assert.equal(build.jobs.release.uses, './.github/workflows/release.yml');
-  assert.ok(build.jobs['create-release-tag'].if.includes("needs.android-build.result == 'success'"));
-  assert.ok(build.jobs['create-release-tag'].if.includes("needs.ios-build.result == 'success'"));
+  assert.ok(build.jobs['create-release-tag'].if.includes("needs.release-android-build.result == 'success'"));
+  assert.ok(build.jobs['create-release-tag'].if.includes("needs.release-ios-build.result == 'success'"));
 });
