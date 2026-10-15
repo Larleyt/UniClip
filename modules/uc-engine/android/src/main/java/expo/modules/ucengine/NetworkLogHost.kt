@@ -38,16 +38,15 @@ internal object NetworkLogHost {
   fun configurationSnapshot(): Configuration = synchronized(lock) { configuration }
 
   /**
-   * Budgets are product decisions that are still open, so a release build supplies none and the
-   * Engine reports `NotConfigured`. Debug builds use fixed test parameters; they are not a product
-   * commitment and must not be copied into the release path without a decision.
+   * Release and debug builds use the same budget: 8 KiB per record, 1,024 queued records, 4 MiB per
+   * file, 16 MiB per run, 64 MiB for the root, 7 days. These are the recommended values from the
+   * network-log proposal, adopted because release builds need the log; change them here only.
    */
-  internal fun budget(role: BindingNetworkProcessRole, debug: Boolean): BindingNetworkLogConfig? =
-    if (!debug) null else BindingNetworkLogConfig(
-      role = role, recordBytes = 8u * 1024u, queueRecords = 1_024u,
-      fileBytes = 4uL * 1024uL * 1024uL, runBytes = 16uL * 1024uL * 1024uL,
-      rootBytes = 64uL * 1024uL * 1024uL, retentionSeconds = 7uL * 24uL * 60uL * 60uL
-    )
+  internal fun budget(role: BindingNetworkProcessRole): BindingNetworkLogConfig = BindingNetworkLogConfig(
+    role = role, recordBytes = 8u * 1024u, queueRecords = 1_024u,
+    fileBytes = 4uL * 1024uL * 1024uL, runBytes = 16uL * 1024uL * 1024uL,
+    rootBytes = 64uL * 1024uL * 1024uL, retentionSeconds = 7uL * 24uL * 60uL * 60uL
+  )
 
   /**
    * Must run before `installProcessObservability` in every process that hosts an Engine. The role
@@ -55,11 +54,9 @@ internal object NetworkLogHost {
    * (service recovery, boot) is the background service, everything else is the app.
    * `explicit` replaces the build's budget; it exists for real-process verification.
    */
-  fun configureBeforeInstall(role: BindingNetworkProcessRole, debug: Boolean, explicit: BindingNetworkLogConfig? = null): Configuration {
-    val config = explicit ?: budget(role, debug)
-    val outcome: Configuration = if (config == null) {
-      Configuration.NotConfigured
-    } else {
+  fun configureBeforeInstall(role: BindingNetworkProcessRole, explicit: BindingNetworkLogConfig? = null): Configuration {
+    val config = explicit ?: budget(role)
+    val outcome: Configuration = run {
       try {
         configureNetworkLog(config)
         Configuration.Configured(roleName(config.role))

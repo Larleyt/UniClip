@@ -441,7 +441,7 @@ object EngineOwner {
       val analytics = analyticsHost(context, appVersion)
       val host = AndroidEngineHost(context, registry)
       // Configured before the process subscriber exists; a failure only shows in the network status.
-      NetworkLogHost.configureBeforeInstall(networkRole, BuildConfig.DEBUG)
+      NetworkLogHost.configureBeforeInstall(networkRole)
       val logSetup = installProcessObservability(
         BindingObservabilityConfig(
           serviceVersion = engineServiceVersion(appVersion),
@@ -668,7 +668,7 @@ class UcEngineModule : Module() {
     if (runCatching { queryLocalDiagnosticStatus() }.isSuccess) return
     val context = requireContext()
     val version = context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
-    NetworkLogHost.configureBeforeInstall(BindingNetworkProcessRole.MOBILE_APP, BuildConfig.DEBUG)
+    NetworkLogHost.configureBeforeInstall(BindingNetworkProcessRole.MOBILE_APP)
     val setup = installProcessObservability(
       BindingObservabilityConfig(engineServiceVersion(version),
         if (BuildConfig.DEBUG) BindingDeploymentEnvironment.DEVELOPMENT else BindingDeploymentEnvironment.PRODUCTION,

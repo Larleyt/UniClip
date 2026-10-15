@@ -29,13 +29,20 @@ The iOS share extension hands off through the App Group and does not host an Eng
 no role. On Android the first install fixes the role of the process; later starts keep the first
 configuration (`AlreadyInstalled` is not an error).
 
-## Budgets are not a product default yet
+## Budget
 
-The Engine has no default budget. A release build currently passes none, so the Engine reports
-`NotConfigured`. Debug builds use fixed test parameters (8 KiB per record, 1,024 queued records,
-4 MiB per file, 16 MiB per run, 64 MiB for the root, 7 days). They are test values, not a product
-commitment. Choosing the release values is a product decision; the only place to change is
-`NetworkLogHost.budget` on each platform.
+The Engine has no default budget, so the host passes one explicitly, the same in release and debug
+builds: 8 KiB per record, 1,024 queued records, 4 MiB per file, 16 MiB per run, 64 MiB for the
+root and 7 days of retention (the values recommended in the network-log proposal). The only place
+to change them is `NetworkLogHost.budget` on each platform. If a process never calls the
+configuration step, the Engine reports `NotConfigured`.
+
+## Detailed capture
+
+Turning on the business Detailed switch (`useEngineDiagnosticCapture`) also opens a 10 minute
+network Detailed window, and turning it off stops it. The two are separate captures: a network
+failure never fails the business capture, and the Engine ends the network window on its own
+timer. Only the current process gets the window; other processes are not woken.
 
 ## JS API
 

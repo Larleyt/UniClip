@@ -9,7 +9,7 @@ public enum NetworkLogHost {
   /// Result of the pre-install configuration step in this process.
   public enum Configuration: Equatable, Sendable {
     case notAttempted
-    /// No budget was supplied for this build, so the Engine runs without a network log.
+    /// No budget was supplied, so the Engine runs without a network log.
     case notConfigured
     case configured(role: String)
     case rejected(String)
@@ -22,45 +22,38 @@ public enum NetworkLogHost {
     lock.withLock { configuration }
   }
 
-  /// Budgets are product decisions that are still open, so a release build supplies none and the
-  /// Engine reports `NotConfigured`. Debug builds use fixed test parameters; they are not a
-  /// product commitment and must not be copied into the release path without a decision.
-  static func budget(role: BindingNetworkProcessRole) -> BindingNetworkLogConfig? {
-    #if DEBUG
-      return BindingNetworkLogConfig(
-        role: role, recordBytes: 8 * 1024, queueRecords: 1_024,
-        fileBytes: 4 * 1024 * 1024, runBytes: 16 * 1024 * 1024,
-        rootBytes: 64 * 1024 * 1024, retentionSeconds: 7 * 24 * 60 * 60
-      )
-    #else
-      return nil
-    #endif
+  /// Release and debug builds use the same budget: 8 KiB per record, 1,024 queued records, 4 MiB per
+  /// file, 16 MiB per run, 64 MiB for the root, 7 days. These are the recommended values from the
+  /// network-log proposal, adopted because release builds need the log; change them here only.
+  static func budget(role: BindingNetworkProcessRole) -> BindingNetworkLogConfig {
+    BindingNetworkLogConfig(
+      role: role, recordBytes: 8 * 1024, queueRecords: 1_024,
+      fileBytes: 4 * 1024 * 1024, runBytes: 16 * 1024 * 1024,
+      rootBytes: 64 * 1024 * 1024, retentionSeconds: 7 * 24 * 60 * 60
+    )
   }
 
   /// Must run before `installProcessObservability` in every process that hosts an Engine.
-  /// `explicit` replaces the build's budget; it exists for real-process verification.
+  /// `explicit` replaces the built-in budget; it exists for real-process verification.
   @discardableResult
   public static func configureBeforeInstall(
     role: BindingNetworkProcessRole, explicit: BindingNetworkLogConfig? = nil
   ) -> Configuration {
     let outcome: Configuration
-    if let config = explicit ?? budget(role: role) {
-      do {
-        try configureNetworkLog(config: config)
-        outcome = .configured(role: roleName(config.role))
-      } catch BindingNetworkLogError.AlreadyInstalled {
-        // The process subscriber is already installed (the diagnostics start and the engine start
-        // both pass through here); the first outcome stays authoritative for this process.
-        return lock.withLock {
-          // Nothing configured before the install means the call order was violated: say so.
-          if configuration == .notAttempted { configuration = .rejected("alreadyInstalled") }
-          return configuration
-        }
-      } catch {
-        outcome = .rejected(errorName(error))
+    let config = explicit ?? budget(role: role)
+    do {
+      try configureNetworkLog(config: config)
+      outcome = .configured(role: roleName(config.role))
+    } catch BindingNetworkLogError.AlreadyInstalled {
+      // The process subscriber is already installed (the diagnostics start and the engine start
+      // both pass through here); the first outcome stays authoritative for this process.
+      return lock.withLock {
+        // Nothing configured before the install means the call order was violated: say so.
+        if configuration == .notAttempted { configuration = .rejected("alreadyInstalled") }
+        return configuration
       }
-    } else {
-      outcome = .notConfigured
+    } catch {
+      outcome = .rejected(errorName(error))
     }
     lock.withLock { configuration = outcome }
     return outcome
