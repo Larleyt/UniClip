@@ -318,6 +318,7 @@ public final class UcEngineModule: Module {
           case .relationshipConflict: "relationshipConflict"
           case .activationStateInvalid: "activationStateInvalid"
           case .peerUpgradeRequired: "peerUpgradeRequired"
+          case .sponsorUnresponsive: "sponsorUnresponsive"
           case .cancelled: "cancelled"
           case .removedBeforeActivation: "removedBeforeActivation"
           }

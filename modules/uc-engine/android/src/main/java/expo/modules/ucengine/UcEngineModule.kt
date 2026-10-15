@@ -885,6 +885,7 @@ class UcEngineModule : Module() {
               JoinSpaceRejectionReason.RELATIONSHIP_CONFLICT -> "relationshipConflict"
               JoinSpaceRejectionReason.ACTIVATION_STATE_INVALID -> "activationStateInvalid"
               JoinSpaceRejectionReason.PEER_UPGRADE_REQUIRED -> "peerUpgradeRequired"
+              JoinSpaceRejectionReason.SPONSOR_UNRESPONSIVE -> "sponsorUnresponsive"
               JoinSpaceRejectionReason.CANCELLED -> "cancelled"
               JoinSpaceRejectionReason.REMOVED_BEFORE_ACTIVATION -> "removedBeforeActivation"
             }
