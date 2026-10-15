@@ -232,9 +232,11 @@ export async function createDiagnosticArchive(
     // Preserve existing evidence even when native status is unavailable.
   }
   throwIfArchiveAborted(signal);
-  const engineLogs = await collectLogFiles(getEngineLogFileUris(), 'logs/engine', signal);
   // The network-library log is a separate source: its failure never changes the Engine or app evidence.
-  const networkLogs = await collectNetworkLogs(signal);
+  const [engineLogs, networkLogs] = await Promise.all([
+    collectLogFiles(getEngineLogFileUris(), 'logs/engine', signal),
+    collectNetworkLogs(signal),
+  ]);
 
   // A failed flush or an unhealthy writer is itself a reason to tell the user, never a reason to stay silent.
   const engineLogIssues: DiagnosticArchiveWarningCode[] = [];
