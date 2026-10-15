@@ -139,6 +139,9 @@ public enum NetworkLogHost {
     NetworkLogExportStaging.release(exportId: exportId, stagingRoot: stagingRoot)
   }
 
+  /// Where earlier runs live when the Engine cannot name its own directory (the App Group container).
+  public static func appGroupNetworkRoot() -> URL? { P2pSharedStore.networkLogRoot() }
+
   public static var defaultStagingRoot: URL {
     FileManager.default.temporaryDirectory.appendingPathComponent("uc-network-log-export", isDirectory: true)
   }

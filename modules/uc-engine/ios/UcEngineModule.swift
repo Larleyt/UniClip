@@ -106,7 +106,7 @@ public final class UcEngineModule: Module {
     AsyncFunction("prepareNetworkLogExport") { () -> [String: Any] in
       try? self.host.prepareDiagnosticLogging()
       return NetworkLogHost.prepareExport(
-        deadlineMs: 1_000, stagingRoot: NetworkLogHost.defaultStagingRoot, fallbackRoot: P2pSharedStore.networkLogRoot()
+        deadlineMs: 1_000, stagingRoot: NetworkLogHost.defaultStagingRoot, fallbackRoot: NetworkLogHost.appGroupNetworkRoot()
       )
     }.runOnQueue(engineOperationQueue)
     AsyncFunction("releaseNetworkLogExport") { (exportId: String) in
