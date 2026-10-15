@@ -2,7 +2,7 @@ import * as Application from 'expo-application';
 import { File, FileMode, Paths } from 'expo-file-system';
 import { Platform } from 'react-native';
 import { strFromU8, strToU8, zipSync } from 'fflate';
-import { getShareDiagnostics } from 'app-group-store';
+import { getAppGroupId, getShareDiagnostics } from 'app-group-store';
 import { loadPowerMetrics } from '@/support/power/powerMetrics';
 import { prepareEngineDiagnosticExport, type EngineDiagnosticExportReport, coreVersion, flushEngineLogs, getEngineLogStatus, getNativeDiagnostics, type EngineLogStatus, type NativeDiagnosticsSnapshot } from 'uc-engine';
 
@@ -10,6 +10,7 @@ import type { SharedSettings } from '@/types/settings';
 import type { PeerConnectionStatus, UnifiedEngineStatus } from '@/stores/unifiedEngineStore';
 import { flushAppLogs, getAppLogCaptureStatus, getAppLogFileUris, getEngineLogFileUris, redactLogText } from '@/support/observability';
 import type { DiagnosticReason } from './diagnosticEventClassifier';
+import type { DiagnosticArchiveWarningCode } from './diagnosticWarnings';
 
 const DIAGNOSTIC_ARCHIVE_SCHEMA_VERSION = 1;
 const MAX_LOG_BYTES_PER_FILE = 5 * 1024 * 1024;
@@ -38,15 +39,8 @@ export interface DiagnosticArchiveInput {
 export interface DiagnosticArtifact {
   uri: string;
   fileName: string;
-}
-
-export type DiagnosticArchiveErrorCode = 'engine_logs_missing' | 'engine_logs_unreadable';
-
-export class DiagnosticArchiveError extends Error {
-  constructor(public readonly code: DiagnosticArchiveErrorCode) {
-    super(code);
-    this.name = 'DiagnosticArchiveError';
-  }
+  /** The package is still produced; these tell the user which evidence is incomplete. */
+  warnings: DiagnosticArchiveWarningCode[];
 }
 
 interface CollectedLogFiles {
@@ -55,6 +49,14 @@ interface CollectedLogFiles {
   includedFileCount: number;
   unreadableFileCount: number;
   truncatedFileCount: number;
+}
+
+// Bundle identifiers carry the variant suffix chosen in app.config.ts.
+function buildVariant(applicationId: string | null): 'production' | 'test' | 'development' | 'unknown' {
+  if (!applicationId) return 'unknown';
+  if (applicationId.endsWith('.test')) return 'test';
+  if (applicationId.endsWith('.dev')) return 'development';
+  return 'production';
 }
 
 function formatFileTimestamp(date: Date): string {
@@ -110,7 +112,11 @@ async function collectLogFiles(
       const truncated = file.size > MAX_LOG_BYTES_PER_FILE;
       const content = truncated ? readBoundedLogTail(file) : await file.text();
       if (truncated) truncatedFileCount += 1;
-      entries[`${directory}/${safeFileName(file.name)}`] = strToU8(redactLogText(content));
+      // The same log name can exist in the current and the legacy directory; keep both copies.
+      const baseName = safeFileName(file.name);
+      let entryName = `${directory}/${baseName}`;
+      for (let copy = 1; entryName in entries; copy += 1) entryName = `${directory}/legacy-${copy}.${baseName}`;
+      entries[entryName] = strToU8(redactLogText(content));
       throwIfArchiveAborted(signal);
     } catch {
       unreadableFileCount += 1;
@@ -227,22 +233,14 @@ export async function createDiagnosticArchive(
   throwIfArchiveAborted(signal);
   const engineLogs = await collectLogFiles(getEngineLogFileUris(), 'logs/engine', signal);
 
-  const engineLogIssues: DiagnosticArchiveErrorCode[] = [];
-  if (
-    engineFlushStatus === 'completed' &&
-    engineLogStatus.localFile === 'ready' &&
-    input.sync.status === 'running' &&
-    engineLogs.discoveredFileCount === 0
-  ) {
-    engineLogIssues.push('engine_logs_missing');
-  }
-  if (
-    engineFlushStatus === 'completed' &&
-    engineLogStatus.localFile === 'ready' &&
-    input.sync.status === 'running' &&
-    engineLogs.discoveredFileCount > 0 &&
-    engineLogs.includedFileCount === 0
-  ) {
+  // A failed flush or an unhealthy writer is itself a reason to tell the user, never a reason to stay silent.
+  const engineLogIssues: DiagnosticArchiveWarningCode[] = [];
+  const engineWrittenCount = engineReport?.files.reduce((total, file) => total + file.writtenCount, 0) ?? 0;
+  if (engineLogs.discoveredFileCount === 0) {
+    if (engineWrittenCount > 0) engineLogIssues.push('engine_logs_written_not_found');
+    else if (input.sync.status === 'running') engineLogIssues.push('engine_logs_missing');
+  } else if (engineLogs.unreadableFileCount > 0) {
+    // Also covers partial loss: some files were included but others could not be read.
     engineLogIssues.push('engine_logs_unreadable');
   }
 
@@ -262,6 +260,8 @@ export async function createDiagnosticArchive(
   try { shareDiagnostics = await getShareDiagnostics(); } catch { /* Preserve independently collected sources. */ }
   throwIfArchiveAborted(signal);
   const shareArchive = shareDiagnostics ?? { schemaVersion: 1, attempts: [] };
+  let appGroupId: string | null = null;
+  try { appGroupId = getAppGroupId(); } catch { /* Android and older native modules have no App Group. */ }
   const nativeSources = nativeSourceCoverage(nativeLogs.entries, nativeDiagnostics);
   const manifest = {
     schemaVersion: DIAGNOSTIC_ARCHIVE_SCHEMA_VERSION,
@@ -269,10 +269,18 @@ export async function createDiagnosticArchive(
     app: {
       version: Application.nativeApplicationVersion ?? 'unknown',
       build: Application.nativeBuildVersion ?? 'unknown',
+      bundleId: Application.applicationId ?? null,
+      buildVariant: buildVariant(Application.applicationId ?? null),
+      appGroupId,
     },
     system: {
       platform: Platform.OS,
       osVersion: String(Platform.Version),
+      // Log timestamps are UTC; this is the offset to read them in the user's local time.
+      timezone: {
+        offsetMinutes: 0 - now.getTimezoneOffset(), // not -x: UTC would yield -0
+        name: Intl.DateTimeFormat().resolvedOptions().timeZone ?? null,
+      },
     },
     coverage: {
       complete: false,
@@ -368,7 +376,7 @@ export async function createDiagnosticArchive(
   try {
     if (artifact.exists) artifact.delete();
     artifact.write(zipSync(entries, { level: 6 }));
-    return { uri: artifact.uri, fileName };
+    return { uri: artifact.uri, fileName, warnings: engineLogIssues };
   } catch (error) {
     if (artifact.exists) artifact.delete();
     throw error;

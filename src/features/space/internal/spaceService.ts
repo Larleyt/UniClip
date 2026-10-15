@@ -20,6 +20,7 @@ import {
   type DeviceTrustQueryState,
 } from '../store';
 import { invitationCodeForSubmission } from '@/utils/invitationCode';
+import { getCurrentNetworkContext } from '@/platform/network';
 import { createLogger } from '@/support/observability';
 import {
   buildSpaceOperationContext,
@@ -186,12 +187,19 @@ export class SpaceOperationInProgressError extends Error {
   }
 }
 
+type JoinNetworkKind = 'wifi' | 'cellular' | 'other';
+
 interface JoinSpaceFailureDetails {
   stage: JoinSpaceStage;
   hadExistingSpace: boolean;
   errorName: string;
   errorCode: number | null;
   userErrorCode: UnifiedSpaceUserErrorCode | null;
+  /** Engine's own terminal status and reason, before they are folded into a user-facing code. */
+  joinStatus: JoinSpaceStatus['type'] | null;
+  rejectionReason: string | null;
+  terminationReason: string | null;
+  networkKind: JoinNetworkKind;
 }
 
 interface SpaceRefreshFailureDetails {
@@ -214,10 +222,19 @@ export class UnifiedSpaceInputError extends Error {
   }
 }
 
+interface JoinResultDetail {
+  joinStatus: JoinSpaceStatus['type'];
+  rejectionReason?: string;
+  terminationReason?: string;
+}
+
 class UnifiedSpaceJoinResultError extends Error {
   readonly name = 'UnifiedSpaceJoinResultError';
 
-  constructor(readonly code: UnifiedSpaceUserErrorCode) {
+  constructor(
+    readonly code: UnifiedSpaceUserErrorCode,
+    readonly detail?: JoinResultDetail
+  ) {
     super(code);
   }
 }
@@ -248,17 +265,9 @@ export function unifiedSpaceUserErrorCode(cause: unknown): UnifiedSpaceUserError
   if (cause instanceof UnifiedSpaceJoinResultError) return cause.code;
   if (cause instanceof UnifiedSpaceInvitationIssueError) return cause.code;
 
-  const details = [String(cause)];
-  if (cause && typeof cause === 'object') {
-    const error = cause as { code?: unknown; message?: unknown; cause?: unknown };
-    details.push(String(error.code ?? ''), String(error.message ?? ''), String(error.cause ?? ''));
-  }
-
-  for (const match of details.join(' ').matchAll(/\b\d{4}\b/g)) {
-    const mapped = USER_ERROR_BY_ENGINE_CODE[Number(match[0])];
-    if (mapped) return mapped;
-  }
-  return null;
+  const failure = structuredEngineFailure(cause);
+  if (failure === null) return null;
+  return USER_ERROR_BY_ENGINE_CODE[failure.code] ?? null;
 }
 
 function rejectedJoinErrorCode(reason: JoinSpaceRejectionReason): UnifiedSpaceUserErrorCode {
@@ -317,19 +326,40 @@ function requireActiveJoinedSpace(status: JoinSpaceStatus): JoinedSpace {
           : 'joinNeedsAttention'
       );
     case 'rejected':
-      throw new UnifiedSpaceJoinResultError(rejectedJoinErrorCode(status.reason));
+      throw new UnifiedSpaceJoinResultError(rejectedJoinErrorCode(status.reason), {
+        joinStatus: 'rejected',
+        rejectionReason: status.reason,
+      });
     case 'terminated':
-      throw new UnifiedSpaceJoinResultError(terminatedJoinErrorCode(status.reason));
+      throw new UnifiedSpaceJoinResultError(terminatedJoinErrorCode(status.reason), {
+        joinStatus: 'terminated',
+        terminationReason: status.reason,
+      });
   }
 }
 
+// The bridge delivers code, category and retryable as fields; message text is never parsed.
+function structuredEngineFailure(
+  cause: unknown
+): { code: number; category: string; retryable: boolean } | null {
+  const source = cause && typeof cause === 'object' ? cause : null;
+  if (!source) return null;
+  const { code, category, retryable } = source as Record<string, unknown>;
+  return typeof code === 'number' && Number.isFinite(code) && typeof category === 'string'
+    ? { code, category, retryable: retryable === true }
+    : null;
+}
+
+// Diagnostic only: operations that are not bridged as structured results still carry the code in
+// their message. This value is logged but never selects a user-facing outcome.
 function engineErrorCode(cause: unknown): number | null {
+  const structured = structuredEngineFailure(cause);
+  if (structured) return structured.code;
   const details: unknown[] = [cause];
   if (cause && typeof cause === 'object') {
     const error = cause as { code?: unknown; message?: unknown; cause?: unknown };
     details.push(error.code, error.message, error.cause);
   }
-
   for (const detail of details) {
     if (typeof detail === 'number' && Number.isFinite(detail)) return detail;
     const match = String(detail ?? '').match(/\b\d{4}\b/);
@@ -349,7 +379,19 @@ function joinSpaceFailureDetails(
     errorName: cause instanceof Error ? 'Error' : typeof cause,
     errorCode: engineErrorCode(cause),
     userErrorCode: unifiedSpaceUserErrorCode(cause),
+    joinStatus: cause instanceof UnifiedSpaceJoinResultError ? (cause.detail?.joinStatus ?? null) : null,
+    rejectionReason:
+      cause instanceof UnifiedSpaceJoinResultError ? (cause.detail?.rejectionReason ?? null) : null,
+    terminationReason:
+      cause instanceof UnifiedSpaceJoinResultError ? (cause.detail?.terminationReason ?? null) : null,
+    networkKind: currentJoinNetworkKind(),
   };
+}
+
+// Only the class of network is recorded; SSIDs and addresses never reach the log.
+function currentJoinNetworkKind(): JoinNetworkKind {
+  const network = getCurrentNetworkContext();
+  return network.isWifi ? 'wifi' : network.isCellular ? 'cellular' : 'other';
 }
 
 function spaceRefreshFailureDetails(

@@ -1,5 +1,6 @@
 import { describe, expect, it, jest } from '@jest/globals';
 import { createLogger } from '../support/observability';
+import { getCurrentNetworkContext, setCurrentNetworkContext } from '../platform/network';
 import {
   UnifiedSpaceInputError,
   UnifiedSpaceService,
@@ -10,6 +11,10 @@ import {
 import type { DeviceTrustDecision, DeviceTrustSnapshot, JoinSpaceStatus } from '../platform/engine';
 
 const log = createLogger('UnifiedSpaceService');
+
+function engineFailure(code: number, category = 'unavailable'): Error {
+  return Object.assign(new Error('Engine failure'), { code, category, retryable: false });
+}
 
 function deviceTrustSnapshot(
   revision = 1,
@@ -839,17 +844,22 @@ describe('UnifiedSpaceService', () => {
     );
   });
   it.each([
-    ['engine error 1233 (Unauthorized)', 'passphraseMismatch'],
-    ['BindingError.Engine(code: 1234, category: notFound, retryable: false)', 'invitationNotFound'],
-    ['BindingError.Engine(code: 1281, category: notFound, retryable: false)', 'invitationExpired'],
-    ['engine error 1236 (Unavailable)', 'sponsorUnreachable'],
-    ['engine error 1285 (DeadlineExceeded)', 'connectionTimedOut'],
-    ['engine error 1282 (Conflict)', 'invitationRejected'],
-    ['engine error 1283 (Unavailable)', 'serviceUnavailable'],
-    ['engine error 1284 (Unavailable)', 'connectionLost'],
-    ['engine error 1292 (Conflict)', 'unreadableHistoryRequiresConfirmation'],
-  ] as const)('maps native failure %s to %s', (message, expected) => {
-    expect(unifiedSpaceUserErrorCode(new Error(message))).toBe(expected);
+    [1233, 'passphraseMismatch'],
+    [1234, 'invitationNotFound'],
+    [1281, 'invitationExpired'],
+    [1236, 'sponsorUnreachable'],
+    [1285, 'connectionTimedOut'],
+    [1282, 'invitationRejected'],
+    [1283, 'serviceUnavailable'],
+    [1284, 'connectionLost'],
+    [1292, 'unreadableHistoryRequiresConfirmation'],
+  ] as const)('maps structured native failure %i to %s', (code, expected) => {
+    expect(unifiedSpaceUserErrorCode(engineFailure(code))).toBe(expected);
+  });
+
+  it('does not derive a user-facing outcome from digits in the message text', () => {
+    expect(unifiedSpaceUserErrorCode(new Error('engine error 1233 (Unauthorized)'))).toBeNull();
+    expect(unifiedSpaceUserErrorCode(Object.assign(new Error('x'), { code: 1233 }))).toBeNull();
   });
 
   it('keeps input validation errors and ignores unknown native failures', () => {
@@ -915,6 +925,45 @@ describe('UnifiedSpaceService', () => {
 
     expect(api.joinSpace).toHaveBeenCalledWith(expected, 'Travel Phone', ' another secret ', false);
   });
+
+  it.each([
+    [{ isWifi: false, isCellular: true }, 'cellular'],
+    [{ isWifi: true, isCellular: false }, 'wifi'],
+    [{ isWifi: false, isCellular: false }, 'other'],
+  ] as const)(
+    'logs the raw Engine rejection reason and the network kind (%j) when a join is rejected',
+    async (network, expectedKind) => {
+      const logError = jest.spyOn(log, 'error').mockImplementation(() => undefined);
+      const previousNetwork = getCurrentNetworkContext();
+      setCurrentNetworkContext({ ...network, isTailscale: false, ssid: 'Private SSID' });
+      try {
+        const api = createApi({
+          joinSpace: jest.fn(async () => ({
+            type: 'rejected',
+            joinId: 'join-1',
+            reason: 'sponsorUnresponsive',
+          })) as unknown as UnifiedSpaceApi['joinSpace'],
+        });
+        const service = new UnifiedSpaceService(api, () => undefined);
+
+        await expect(service.joinSpace('072-834', 'Phone', 'secret')).rejects.toBeDefined();
+
+        expect(logError).toHaveBeenCalledWith(
+          'Join space failed',
+          expect.objectContaining({
+            stage: 'requestJoin',
+            joinStatus: 'rejected',
+            rejectionReason: 'sponsorUnresponsive',
+            networkKind: expectedKind,
+          })
+        );
+        expect(JSON.stringify(logError.mock.calls)).not.toContain('Private SSID');
+      } finally {
+        setCurrentNetworkContext(previousNetwork);
+        logError.mockRestore();
+      }
+    }
+  );
 
   it('passes explicit unreadable-history confirmation to the native engine', async () => {
     const api = createApi();
@@ -1243,7 +1292,7 @@ describe('UnifiedSpaceService', () => {
         new Error(
           `Engine error 1283 while joining ${invitation} as ${deviceName} using ${secret} at ${privatePath}`
         ),
-        { code: 1283 }
+        { code: 1283, category: 'unavailable', retryable: true }
       );
       const api = createApi({
         joinSpace: failJoinRequest
@@ -1339,7 +1388,7 @@ describe('UnifiedSpaceService', () => {
   ] as const)('maps invitation issue failure %i to %s', async (code, expected) => {
     const api = createApi({
       issueInvitation: jest.fn(async () => {
-        throw new Error(`BindingError.Engine(code: ${code}, category: unavailable, retryable: true)`);
+        throw engineFailure(code);
       }),
     });
     const service = new UnifiedSpaceService(api);
@@ -1352,7 +1401,7 @@ describe('UnifiedSpaceService', () => {
   it('maps invitation issue failures while creating a space', async () => {
     const api = createApi({
       issueInvitation: jest.fn(async () => {
-        throw new Error('BindingError.Engine(code: 1227, category: unavailable, retryable: true)');
+        throw engineFailure(1227);
       }),
     });
     const service = new UnifiedSpaceService(api);
@@ -1367,7 +1416,7 @@ describe('UnifiedSpaceService', () => {
     async (code) => {
       const api = createApi({
         issueInvitation: jest.fn(async () => {
-          throw new Error(`BindingError.Engine(code: ${code}, category: internal, retryable: false)`);
+          throw engineFailure(code, 'internal');
         }),
       });
       const service = new UnifiedSpaceService(api);
@@ -1383,7 +1432,7 @@ describe('UnifiedSpaceService', () => {
     (code) => {
       expect(
         unifiedSpaceUserErrorCode(
-          new Error(`BindingError.Engine(code: ${code}, category: invalidInput, retryable: false)`)
+          engineFailure(code, 'invalidInput')
         )
       ).toBeNull();
     }

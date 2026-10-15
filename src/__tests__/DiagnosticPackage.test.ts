@@ -30,6 +30,7 @@ jest.mock('react-native', () => ({
 jest.mock('expo-application', () => ({
   nativeApplicationVersion: '2.0.0',
   nativeBuildVersion: '177',
+  applicationId: 'app.uniclipboard.UniClipboard.dev',
 }));
 
 jest.mock('../support/observability', () => ({
@@ -42,6 +43,7 @@ jest.mock('../support/observability', () => ({
 
 jest.mock('app-group-store', () => ({
   getShareDiagnostics: () => mockGetShareDiagnostics(),
+  getAppGroupId: () => 'group.app.uniclipboard.UniClipboard.dev',
 }));
 
 jest.mock('expo-file-system', () => {
@@ -385,6 +387,7 @@ describe('DiagnosticArchive', () => {
     expect(artifact).toEqual({
       uri: 'file://cache/uniclip_diagnostics_2026-08-16_11-32-31.zip',
       fileName: 'uniclip_diagnostics_2026-08-16_11-32-31.zip',
+      warnings: [],
     });
     expect(Object.keys(archive).sort()).toEqual([
       'extensions/share_attempts.json',
@@ -491,23 +494,105 @@ describe('DiagnosticArchive', () => {
     expect(mockLogHandles[0].close).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps available evidence and flags missing Engine files', async () => {
+  it('records the app identity and timezone needed to read the logs', async () => {
+    const now = new Date('2026-10-14T12:00:00.000Z');
+
+    const manifest = JSON.parse(readArchive((await createDiagnosticArchive(input, now)).uri)['manifest.json']);
+
+    expect(manifest.app).toMatchObject({
+      bundleId: 'app.uniclipboard.UniClipboard.dev',
+      buildVariant: 'development',
+      appGroupId: 'group.app.uniclipboard.UniClipboard.dev',
+    });
+    expect(manifest.system.timezone).toEqual({
+      offsetMinutes: 0 - now.getTimezoneOffset(),
+      name: Intl.DateTimeFormat().resolvedOptions().timeZone ?? null,
+    });
+  });
+
+  it('keeps both copies when the same Engine log name exists in the new and legacy directories', async () => {
+    mockGetEngineLogFileUris.mockReturnValue([
+      '/shared/p2p/data/logs/engine.2026-10-14.jsonl',
+      '/shared/p2p/cache/logs/engine.2026-10-14.jsonl',
+    ]);
+    mockLogContents.set('/shared/p2p/data/logs/engine.2026-10-14.jsonl', '{"where":"new"}');
+    mockLogContents.set('/shared/p2p/cache/logs/engine.2026-10-14.jsonl', '{"where":"legacy"}');
+
+    const artifact = await createDiagnosticArchive(input);
+    const archive = readArchive(artifact.uri);
+    const manifest = JSON.parse(archive['manifest.json']);
+
+    expect(archive['logs/engine/engine.2026-10-14.jsonl']).toContain('new');
+    expect(archive['logs/engine/legacy-1.engine.2026-10-14.jsonl']).toContain('legacy');
+    expect(manifest.collection.engineLogs.includedFileCount).toBe(2);
+  });
+
+  it('keeps available evidence and warns the caller about missing Engine files', async () => {
     mockGetAppLogFileUris.mockReturnValue(['file://documents/logs/app_2026-08-16.txt']);
     mockLogContents.set('file://documents/logs/app_2026-08-16.txt', 'app log');
 
-    const manifest = JSON.parse(readArchive((await createDiagnosticArchive(input)).uri)['manifest.json']);
-    expect(manifest.collection.engineLogs.issues).toContain('engine_logs_missing');
+    const artifact = await createDiagnosticArchive(input);
+    const manifest = JSON.parse(readArchive(artifact.uri)['manifest.json']);
+    expect(artifact.warnings).toEqual(['engine_logs_missing']);
+    expect(manifest.collection.engineLogs.issues).toEqual(['engine_logs_missing']);
     expect(manifest.coverage.complete).toBe(false);
   });
 
-  it('keeps available evidence and flags unreadable Engine files', async () => {
-    mockGetAppLogFileUris.mockReturnValue(['file://documents/logs/app_2026-08-16.txt']);
-    mockGetEngineLogFileUris.mockReturnValue(['/shared/p2p/cache/logs/engine.2026-08-16.txt']);
-    mockLogContents.set('file://documents/logs/app_2026-08-16.txt', 'app log');
+  it('warns about missing Engine files even when the Engine flush failed', async () => {
+    mockFlushEngineLogs.mockResolvedValue(false);
+    mockGetEngineLogStatus.mockResolvedValue({ localFile: 'failed', droppedLocalRecords: null, installation: null });
 
-    const manifest = JSON.parse(readArchive((await createDiagnosticArchive(input)).uri)['manifest.json']);
-    expect(manifest.collection.engineLogs.issues).toContain('engine_logs_unreadable');
+    const artifact = await createDiagnosticArchive(input);
+    expect(artifact.warnings).toEqual(['engine_logs_missing']);
+  });
+
+  it('keeps available evidence and warns about unreadable Engine files', async () => {
+    mockGetAppLogFileUris.mockReturnValue(['file://documents/logs/app_2026-08-16.txt']);
+    mockGetEngineLogFileUris.mockReturnValue(['/shared/p2p/data/logs/engine.2026-08-16.txt']);
+    mockLogContents.set('file://documents/logs/app_2026-08-16.txt', 'app log');
+    mockFlushEngineLogs.mockResolvedValue(false);
+
+    const artifact = await createDiagnosticArchive(input);
+    const manifest = JSON.parse(readArchive(artifact.uri)['manifest.json']);
+    expect(artifact.warnings).toEqual(['engine_logs_unreadable']);
     expect(manifest.collection.engineLogs.unreadableFileCount).toBe(1);
+  });
+
+  it('warns when only some Engine files are unreadable', async () => {
+    mockGetEngineLogFileUris.mockReturnValue(['/logs/readable.jsonl', '/logs/broken.jsonl']);
+    mockLogContents.set('/logs/readable.jsonl', '{"ok":1}');
+    // No content registered for broken.jsonl: the mock throws 'unreadable' when it is read.
+
+    const artifact = await createDiagnosticArchive(input);
+    const archive = readArchive(artifact.uri);
+    expect(archive['logs/engine/readable.jsonl']).toBeDefined();
+    expect(artifact.warnings).toEqual(['engine_logs_unreadable']);
+  });
+
+  it.each(['completed', 'failed'] as const)(
+    'reports written Engine records that have no file on disk when the flush is %s',
+    async (flush) => {
+      mockPrepareEngineDiagnosticExport.mockResolvedValue({
+        flush, requestedAtUtc: '', completedAtUtc: '', otherProcessesFlushed: false,
+        status: { capture: { mode: 'standard' }, engineVersion: 'v', sourceCommit: 'b'.repeat(40) },
+        files: [
+          { source: 'a', acceptedCount: 3, writtenCount: 3, queueDroppedCount: 0, quotaDroppedCount: 0, writeFailedCount: 0, lastWrittenAtMs: 1 },
+          { source: 'b', acceptedCount: 2, writtenCount: 2, queueDroppedCount: 0, quotaDroppedCount: 0, writeFailedCount: 0, lastWrittenAtMs: 1 },
+        ],
+      });
+
+      const artifact = await createDiagnosticArchive({ ...input, sync: { ...input.sync, status: 'stopped' } });
+      const manifest = JSON.parse(readArchive(artifact.uri)['manifest.json']);
+      expect(artifact.warnings).toEqual(['engine_logs_written_not_found']);
+      expect(manifest.collection.engineLogs.issues).toEqual(['engine_logs_written_not_found']);
+    }
+  );
+
+  it('returns no warnings when Engine files were exported', async () => {
+    mockGetEngineLogFileUris.mockReturnValue(['/logs/engine.2026-10-14.jsonl']);
+    mockLogContents.set('/logs/engine.2026-10-14.jsonl', '{"event":"x"}');
+
+    expect((await createDiagnosticArchive(input)).warnings).toEqual([]);
   });
 
   it('allows a stopped Engine to be reported as unavailable', async () => {
