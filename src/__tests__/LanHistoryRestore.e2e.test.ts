@@ -3,14 +3,17 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { File } from 'expo-file-system';
 import { Platform } from 'react-native';
-import { getDatabase } from '../platform/database';
+import { getDatabase, TABLE_HISTORY } from '../platform/database';
 import { LanRemoteContentApplier } from '../features/lan-sync/internal/lanRemoteContentApplier';
+import { ClipboardManager } from '../features/clipboard/internal/clipboardManager';
 import { historyStorage, useHistoryStore } from '../features/history';
 import {
   createDefaultClipboardItem,
@@ -18,6 +21,34 @@ import {
   type ClipboardContent,
   type ClipboardItem,
 } from '../types/clipboard';
+
+const mockGetFileSourceIdAsync = jest.fn();
+const mockSaveFileToFileAsync = jest.fn();
+
+jest.mock('expo-image-picker', () => ({}));
+
+jest.mock('android-util', () => ({
+  isNativeHashModuleAvailable: false,
+  nativeCalculateFileHash: jest.fn(),
+  nativeSetClipboardImageFromFile: jest.fn(),
+  nativeSaveClipboardFileToFile: jest.fn().mockResolvedValue(null),
+  nativeGetClipboardFileSourceId: jest.fn().mockReturnValue(null),
+  isTailscaleActive: jest.fn().mockReturnValue(false),
+  singleAttemptSender: jest.fn().mockReturnValue(null),
+}));
+
+jest.mock('../utils/clipboardProxy', () => ({
+  getFileSourceIdAsync: (...args: unknown[]) => mockGetFileSourceIdAsync(...args),
+  saveFileToFileAsync: (...args: unknown[]) => mockSaveFileToFileAsync(...args),
+  getStringAsync: jest.fn().mockResolvedValue(''),
+  hasImageAsync: jest.fn().mockResolvedValue(false),
+  hasStringAsync: jest.fn().mockResolvedValue(false),
+  saveImageToFileAsync: jest.fn().mockResolvedValue(null),
+}));
+
+jest.mock('../utils/androidBackgroundClipboardAccess', () => ({
+  getBackgroundClipboardAdapter: jest.fn(() => null),
+}));
 
 jest.mock('expo-file-system', () => {
   const fs = require('node:fs') as typeof import('node:fs');
@@ -39,6 +70,8 @@ jest.mock('expo-file-system', () => {
   const movedGates = new Map<string, ReturnType<typeof makeGate>>();
   const moveFailures = new Map<string, Error>();
   const deleteFailures = new Map<string, Error>();
+  const constructionFailures = new Map<string, Error>();
+  const existsFailures = new Map<string, Error>();
 
   const pathOf = (value: unknown): string => {
     if (typeof value === 'object' && value !== null && 'path' in value) {
@@ -99,12 +132,17 @@ jest.mock('expo-file-system', () => {
     readonly isDirectory = false;
 
     constructor(...parts: unknown[]) {
+      const raw = parts.map((part) => pathOf(part)).join('/');
+      const constructionFailure = constructionFailures.get(raw);
+      if (constructionFailure) throw constructionFailure;
       this.path = path.join(pathOf(parts[0]), ...parts.slice(1).map(String));
       this.uri = uriOf(this.path);
       this.name = path.basename(this.path);
     }
 
     get exists(): boolean {
+      const failure = existsFailures.get(this.uri);
+      if (failure) throw failure;
       return fs.existsSync(this.path);
     }
 
@@ -114,6 +152,19 @@ jest.mock('expo-file-system', () => {
 
     info(): { exists: boolean; size: number | null } {
       return { exists: this.exists, size: this.size };
+    }
+
+    open(): { readBytes(size: number): Uint8Array; close(): void } {
+      const bytes = fs.readFileSync(this.path);
+      let offset = 0;
+      return {
+        readBytes(size: number) {
+          const chunk = bytes.subarray(offset, offset + size);
+          offset += chunk.length;
+          return chunk;
+        },
+        close() {},
+      };
     }
 
     text(): Promise<string> {
@@ -170,6 +221,8 @@ jest.mock('expo-file-system', () => {
       movedGates.clear();
       moveFailures.clear();
       deleteFailures.clear();
+      constructionFailures.clear();
+      existsFailures.clear();
       fs.rmSync(fixtureRoot, { recursive: true, force: true });
       fs.mkdirSync(fixtureRoot, { recursive: true });
     },
@@ -178,6 +231,8 @@ jest.mock('expo-file-system', () => {
       movedGates.clear();
       moveFailures.clear();
       deleteFailures.clear();
+      constructionFailures.clear();
+      existsFailures.clear();
       fs.rmSync(fixtureRoot, { recursive: true, force: true });
     },
     failMove(profileHash: string, error: Error) {
@@ -195,6 +250,12 @@ jest.mock('expo-file-system', () => {
     },
     failDelete(profileHash: string, error: Error) {
       deleteFailures.set(profileHash, error);
+    },
+    failConstruction(uri: string, error: Error) {
+      constructionFailures.set(uri, error);
+    },
+    failExists(uri: string, error: Error) {
+      existsFailures.set(uri, error);
     },
     async deleteHistoryFileDir(type: string, profileHash: string): Promise<void> {
       fs.rmSync(
@@ -221,15 +282,23 @@ jest.mock('expo-file-system', () => {
 
 jest.mock('@/platform/files', () => {
   const actual = jest.requireActual('@/platform/files');
+  const android = jest.requireActual('@/platform/files/fileStorage.android');
   return {
     ...actual,
     deleteHistoryFileDir: (type: string, profileHash: string) =>
       require('expo-file-system').__controls.deleteHistoryFileDir(type, profileHash),
+    getHistoryFileUri: android.getHistoryFileUri,
   };
 });
 
 jest.mock('../features/settings', () => ({
   configStorage: { getConfig: jest.fn().mockResolvedValue({ maxHistoryItems: 1000 }) },
+  useSettingsStore: {
+    getState: jest.fn(() => ({
+      config: { clipboardAccessMethod: 'overlay-polling' },
+      isTempDisabledBackgroundTasks: false,
+    })),
+  },
 }));
 
 type FsControls = {
@@ -240,6 +309,8 @@ type FsControls = {
   blockMove(profileHash: string): FsGate;
   blockAfterMove(profileHash: string): FsGate;
   failDelete(profileHash: string, error: Error): void;
+  failConstruction(uri: string, error: Error): void;
+  failExists(uri: string, error: Error): void;
 };
 
 type FsGate = { entered: Promise<void>; release(): void };
@@ -247,6 +318,55 @@ type FsGate = { entered: Promise<void>; release(): void };
 const controls = (require('expo-file-system') as { __controls: FsControls }).__controls;
 const freshTime = 1_800_000_123_456;
 const originalPlatform = Platform.OS;
+const clipboardSourceId = 'content://clipboard/current-file';
+let nativeCopySequence = 0;
+
+type NativeClipboardFile = {
+  filePath: string;
+  displayName: string;
+  mimeType: string;
+  size: number;
+  sourceId: string;
+};
+
+function fileHash(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex').toUpperCase();
+}
+
+function nativeClipboardFile(
+  bytes: Buffer,
+  displayName = 'clipboard.log',
+  sourceId = clipboardSourceId
+): NativeClipboardFile {
+  const filePath = join(
+    controls.fixtureRoot,
+    'cache/temp_files',
+    `${++nativeCopySequence}-${displayName}`
+  );
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, bytes);
+  return {
+    filePath: pathToFileURL(filePath).href,
+    displayName,
+    mimeType: 'text/plain',
+    size: bytes.length,
+    sourceId,
+  };
+}
+
+function historyItemFromContent(content: ClipboardContent): ClipboardItem {
+  return createDefaultClipboardItem({
+    type: content.type,
+    text: content.text ?? '',
+    profileHash: content.profileHash ?? '',
+    hasData: Boolean(content.fileUri),
+    dataName: content.fileName,
+    size: content.fileSize,
+    timestamp: content.timestamp,
+    fileUri: content.fileUri,
+    localClipboardHash: content.localClipboardHash,
+  });
+}
 
 type MutableStorageState = {
   initialized: boolean;
@@ -366,6 +486,12 @@ beforeAll(() => {
 
 beforeEach(async () => {
   controls.reset();
+  nativeCopySequence = 0;
+  jest.clearAllMocks();
+  mockGetFileSourceIdAsync.mockReset();
+  mockSaveFileToFileAsync.mockReset();
+  mockGetFileSourceIdAsync.mockResolvedValue(clipboardSourceId);
+  mockSaveFileToFileAsync.mockResolvedValue(null);
   if (storageState.notifyTimer) clearTimeout(storageState.notifyTimer);
   Object.assign(storageState, {
     initialized: false,
@@ -387,6 +513,7 @@ afterEach(() => {
   if (storageState.notifyTimer) clearTimeout(storageState.notifyTimer);
   useHistoryStore.getState().reset();
   jest.restoreAllMocks();
+  jest.useRealTimers();
   controls.clean();
 });
 
@@ -698,4 +825,186 @@ describe('LAN receive history persistence', () => {
     await expect(historyStorage.getItem(hash)).resolves.toEqual(existing);
     expect(readFileSync(fileURLToPath(existing.fileUri!))).toEqual(Buffer.from('old bytes'));
   });
+});
+
+describe('clipboard file cache persistence', () => {
+  it('re-reads a changed file when the cached history payload disappears', async () => {
+    const oldBytes = Buffer.from('clipboard bytes before replacement');
+    const freshBytes = Buffer.from('fresh bytes behind the same source id');
+    mockSaveFileToFileAsync
+      .mockImplementationOnce(async () => nativeClipboardFile(oldBytes))
+      .mockImplementationOnce(async () => nativeClipboardFile(freshBytes));
+    const manager = new ClipboardManager();
+
+    const first = (await manager.getClipboardContent())!;
+    const stored = await historyStorage.addItem(historyItemFromContent(first));
+    const cached = await manager.getClipboardContent();
+
+    expect(cached?.fileUri).toBe(stored.fileUri);
+    expect(mockSaveFileToFileAsync).toHaveBeenCalledTimes(1);
+
+    rmSync(fileURLToPath(stored.fileUri!));
+    const refreshed = await manager.getClipboardContent();
+
+    expect(refreshed).toMatchObject({
+      fileUri: expect.any(String),
+      localClipboardHash: fileHash(freshBytes),
+      hasData: true,
+    });
+    expect(readFileSync(fileURLToPath(refreshed!.fileUri!))).toEqual(freshBytes);
+    expect(mockSaveFileToFileAsync).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns null for a failed stale-cache refresh and retries on the next tick', async () => {
+    const firstBytes = Buffer.from('temporary clipboard payload');
+    const retryBytes = Buffer.from('payload available on the next poll');
+    mockSaveFileToFileAsync
+      .mockImplementationOnce(async () => nativeClipboardFile(firstBytes))
+      .mockResolvedValueOnce(null)
+      .mockImplementationOnce(async () => nativeClipboardFile(retryBytes));
+    const manager = new ClipboardManager();
+
+    const first = (await manager.getClipboardContent())!;
+    rmSync(fileURLToPath(first.fileUri!));
+
+    await expect(manager.getClipboardContent()).resolves.toBeNull();
+    const retried = await manager.getClipboardContent();
+
+    expect(retried?.localClipboardHash).toBe(fileHash(retryBytes));
+    expect(readFileSync(fileURLToPath(retried!.fileUri!))).toEqual(retryBytes);
+    expect(mockSaveFileToFileAsync).toHaveBeenCalledTimes(3);
+  });
+
+  it('coalesces concurrent refreshes of the same stale cached file', async () => {
+    const firstBytes = Buffer.from('cached file that will disappear');
+    const retryBytes = Buffer.from('one shared fresh native copy');
+    mockSaveFileToFileAsync.mockImplementationOnce(async () => nativeClipboardFile(firstBytes));
+    const manager = new ClipboardManager();
+    const first = (await manager.getClipboardContent())!;
+    rmSync(fileURLToPath(first.fileUri!));
+
+    let releaseRefresh!: () => void;
+    const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    mockSaveFileToFileAsync.mockImplementationOnce(async () => {
+      await refreshGate;
+      return nativeClipboardFile(retryBytes);
+    });
+    const reads = [manager.getClipboardContent(), manager.getClipboardContent()];
+    await Promise.resolve();
+    releaseRefresh();
+    const [left, right] = await Promise.all(reads);
+
+    expect(mockSaveFileToFileAsync).toHaveBeenCalledTimes(2);
+    expect(left?.fileUri).toBe(right?.fileUri);
+    expect(readFileSync(fileURLToPath(left!.fileUri!))).toEqual(retryBytes);
+  });
+
+  it.each(['constructor', 'exists'] as const)(
+    'recovers from a persisted URI whose File %s throws',
+    async (failureKind) => {
+      const bytes = Buffer.from(`payload for ${failureKind} failure`);
+      const hash = fileHash(bytes);
+      const sourceUri = sourceFile(hash, 'clipboard.log', bytes);
+      const stored = await historyStorage.addItem(createDefaultClipboardItem({
+        type: 'File',
+        text: 'clipboard.log',
+        profileHash: hash,
+        localClipboardHash: hash,
+        hasData: true,
+        dataName: 'clipboard.log',
+        size: bytes.length,
+        fileUri: sourceUri,
+      }));
+      const corruptUri = failureKind === 'constructor'
+        ? 'content://corrupt/persisted-file'
+        : pathToFileURL(join(controls.fixtureRoot, 'cache/unreadable-persisted-file')).href;
+      if (failureKind === 'constructor') {
+        controls.failConstruction(corruptUri, new Error('invalid persisted URI'));
+      } else {
+        controls.failExists(corruptUri, new Error('persisted URI cannot be inspected'));
+      }
+      const db = await getDatabase();
+      await db.runAsync(
+        `UPDATE ${TABLE_HISTORY} SET fileUri = ? WHERE profileHash = ?`,
+        corruptUri,
+        hash
+      );
+      expect(await historyStorage.getItemByLocalHash(hash)).toMatchObject({
+        fileUri: corruptUri,
+      });
+      expect(existsSync(fileURLToPath(stored.fileUri!))).toBe(true);
+      const { getHistoryFileUri } = await import('@/platform/files');
+      await expect(getHistoryFileUri('File', hash, 'clipboard.log')).resolves.toBe(stored.fileUri);
+      if (failureKind === 'exists') {
+        expect(() => new File(corruptUri).exists).toThrow('persisted URI cannot be inspected');
+      }
+      mockSaveFileToFileAsync.mockImplementation(async () => nativeClipboardFile(bytes));
+      const manager = new ClipboardManager();
+
+      const first = await manager.getClipboardContent();
+      const cached = await manager.getClipboardContent();
+
+      expect(first?.fileUri).toBe(stored.fileUri);
+      expect(cached?.fileUri).toBe(stored.fileUri);
+      expect(mockSaveFileToFileAsync).toHaveBeenCalledTimes(1);
+      expect(readdirSync(join(controls.fixtureRoot, 'cache/temp_files'))).toEqual([]);
+
+      rmSync(fileURLToPath(stored.fileUri!));
+      const fresh = await manager.getClipboardContent();
+
+      expect(fresh?.fileUri).toEqual(expect.any(String));
+      expect(fresh?.fileUri).not.toBe(stored.fileUri);
+      expect(readFileSync(fileURLToPath(fresh!.fileUri!))).toEqual(bytes);
+      expect(mockSaveFileToFileAsync).toHaveBeenCalledTimes(2);
+    }
+  );
+});
+
+describe('clipboard monitor deferred file persistence', () => {
+  it.each(['deleted', 'unreadable'] as const)(
+    'drops a file that becomes %s between the poll and its debounced callbacks',
+    async (failureKind) => {
+    const { ClipboardMonitor } = require('../features/clipboard/internal/clipboardMonitor') as
+      typeof import('../features/clipboard/internal/clipboardMonitor');
+    jest.useFakeTimers({ doNotFake: ['Date'] });
+    const bytes = Buffer.from('file removed during the debounce window');
+    let copiedFile: NativeClipboardFile | null = null;
+    mockSaveFileToFileAsync.mockImplementationOnce(async () => {
+      copiedFile = nativeClipboardFile(bytes);
+      return copiedFile;
+    });
+    const monitor = new ClipboardMonitor(new ClipboardManager(), {
+      pollingInterval: 60_000,
+      debounceDelay: 300,
+      stopOnBackground: false,
+    });
+    const persist = jest.fn((content: ClipboardContent) => {
+      void useHistoryStore
+        .getState()
+        .addItem(historyItemFromContent(content), { throwOnFailure: true })
+        .catch(() => undefined);
+    });
+    const externalNotify = jest.fn();
+    monitor.addCallback(persist);
+    monitor.addCallback(externalNotify);
+    await monitor.start();
+
+    const check = monitor.triggerCheck();
+    await jest.advanceTimersByTimeAsync(0);
+    await check;
+    if (failureKind === 'deleted') {
+      rmSync(fileURLToPath(copiedFile!.filePath));
+    } else {
+      controls.failExists(copiedFile!.filePath, new Error('clipboard payload is unreadable'));
+    }
+    await jest.advanceTimersByTimeAsync(300);
+    await Promise.resolve();
+
+    expect(persist).not.toHaveBeenCalled();
+    expect(externalNotify).not.toHaveBeenCalled();
+    await expect(historyStorage.getItem(fileHash(bytes))).resolves.toBeNull();
+    expect(useHistoryStore.getState().error).toBeNull();
+    monitor.stop();
+    }
+  );
 });

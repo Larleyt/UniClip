@@ -40,15 +40,15 @@ export class ClipboardManager {
     try {
       const fileSourceId = await ClipboardProxy.getFileSourceIdAsync();
       if (fileSourceId) {
-        if (fileSourceId === this._lastFileSourceId && this._lastFileContent) {
-          return await this.getCachedFileContent(Date.now());
-        }
         if (this._fileReadInFlight?.sourceId === fileSourceId) {
           const content = await this._fileReadInFlight.promise;
           return content ? { ...content, timestamp: Date.now() } : null;
         }
 
-        const promise = this.readClipboardFile();
+        const promise =
+          fileSourceId === this._lastFileSourceId && this._lastFileContent
+            ? this.getCachedFileContent(Date.now())
+            : this.readClipboardFile();
         this._fileReadInFlight = { sourceId: fileSourceId, promise };
         try {
           return await promise;
@@ -105,6 +105,25 @@ export class ClipboardManager {
     this._lastFileContent = null;
   }
 
+  private async resolveHistoryFileUri(
+    profileHash: string,
+    dataName: string,
+    persistedUri?: string
+  ): Promise<string | null> {
+    if (persistedUri) {
+      try {
+        if (new FileSystem.File(persistedUri).exists) return persistedUri;
+      } catch (error) {
+        log.debug(
+          'Stored history file URI is unavailable:',
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+    }
+    const { getHistoryFileUri } = await import('@/platform/files');
+    return getHistoryFileUri('File', profileHash, dataName);
+  }
+
   private async readClipboardFile(): Promise<ClipboardContent | null> {
     const file = await ClipboardProxy.saveFileToFileAsync(CLIPBOARD_TEMP_DIR.uri);
     if (!file) {
@@ -115,19 +134,11 @@ export class ClipboardManager {
     const localClipboardHash = await calculateFileHash(file.filePath);
     const historyItem = await historyStorage.getItemByLocalHash(localClipboardHash);
     if (historyItem?.type === 'File' && historyItem.hasData && historyItem.dataName) {
-      let historyFileUri: string | null = null;
-      if (historyItem.fileUri) {
-        const persistedFile = new FileSystem.File(historyItem.fileUri);
-        if (persistedFile.exists) historyFileUri = historyItem.fileUri;
-      }
-      if (!historyFileUri) {
-        const { getHistoryFileUri } = await import('@/platform/files');
-        historyFileUri = await getHistoryFileUri(
-          'File',
-          historyItem.profileHash,
-          historyItem.dataName
-        );
-      }
+      const historyFileUri = await this.resolveHistoryFileUri(
+        historyItem.profileHash,
+        historyItem.dataName,
+        historyItem.fileUri
+      );
       if (historyFileUri) {
         try {
           new FileSystem.File(file.filePath).delete();
@@ -170,25 +181,17 @@ export class ClipboardManager {
     return content;
   }
 
-  private async getCachedFileContent(timestamp: number): Promise<ClipboardContent> {
+  private async getCachedFileContent(timestamp: number): Promise<ClipboardContent | null> {
     const cached = this._lastFileContent!;
     const historyItem = cached.localClipboardHash
       ? await historyStorage.getItemByLocalHash(cached.localClipboardHash)
       : null;
     if (historyItem?.type === 'File' && historyItem.hasData && historyItem.dataName) {
-      let historyFileUri: string | null = null;
-      if (historyItem.fileUri) {
-        const persistedFile = new FileSystem.File(historyItem.fileUri);
-        if (persistedFile.exists) historyFileUri = historyItem.fileUri;
-      }
-      if (!historyFileUri) {
-        const { getHistoryFileUri } = await import('@/platform/files');
-        historyFileUri = await getHistoryFileUri(
-          'File',
-          historyItem.profileHash,
-          historyItem.dataName
-        );
-      }
+      const historyFileUri = await this.resolveHistoryFileUri(
+        historyItem.profileHash,
+        historyItem.dataName,
+        historyItem.fileUri
+      );
       if (historyFileUri) {
         this._lastFileContent = {
           ...cached,
@@ -202,7 +205,11 @@ export class ClipboardManager {
         return this._lastFileContent;
       }
     }
-    return { ...cached, timestamp };
+    if (cached.fileUri && new FileSystem.File(cached.fileUri).exists) {
+      return { ...cached, timestamp };
+    }
+    this.resetFileReadCache();
+    return this.readClipboardFile();
   }
 
   /**

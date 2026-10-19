@@ -9,6 +9,7 @@ import { ClipboardManager } from './clipboardManager';
 import { ClipboardContent, ClipboardChangeCallback, ClipboardMonitorOptions } from '@/types';
 import { setTimer, clearTimer } from 'native-timer';
 import { getPasteboardChangeCount } from 'app-group-store';
+import { File } from 'expo-file-system';
 import * as ClipboardProxy from '@/utils/clipboardProxy';
 import { getBackgroundClipboardAdapter } from '@/utils/androidBackgroundClipboardAccess';
 import type { BackgroundClipboardAdapter } from '@/utils/backgroundClipboardAccess';
@@ -453,6 +454,20 @@ export class ClipboardMonitor {
         if (this.debounceTimerTag) {
           clearTimer(this.debounceTimerTag);
           this.debounceTimerTag = null;
+        }
+        if (content.type === 'File') {
+          try {
+            if (!content.fileUri || !new File(content.fileUri).exists) {
+              log.debug('Skipping deferred clipboard file because its payload no longer exists');
+              return;
+            }
+          } catch (error) {
+            log.debug(
+              'Skipping deferred clipboard file because its payload cannot be checked:',
+              error
+            );
+            return;
+          }
         }
         this.callbacks.forEach((callback) => {
           try {
