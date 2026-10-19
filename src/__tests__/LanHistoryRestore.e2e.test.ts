@@ -9,6 +9,7 @@ import {
 import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { File } from 'expo-file-system';
 import { Platform } from 'react-native';
 import { getDatabase, TABLE_HISTORY } from '../platform/database';
@@ -257,6 +258,9 @@ jest.mock('expo-file-system', () => {
     failExists(uri: string, error: Error) {
       existsFailures.set(uri, error);
     },
+    restoreExists(uri: string) {
+      existsFailures.delete(uri);
+    },
     async deleteHistoryFileDir(type: string, profileHash: string): Promise<void> {
       fs.rmSync(
         path.join(fixtureRoot, 'documents/clipboards/history', `${type}-${profileHash}`),
@@ -311,6 +315,7 @@ type FsControls = {
   failDelete(profileHash: string, error: Error): void;
   failConstruction(uri: string, error: Error): void;
   failExists(uri: string, error: Error): void;
+  restoreExists(uri: string): void;
 };
 
 type FsGate = { entered: Promise<void>; release(): void };
@@ -320,6 +325,8 @@ const freshTime = 1_800_000_123_456;
 const originalPlatform = Platform.OS;
 const clipboardSourceId = 'content://clipboard/current-file';
 let nativeCopySequence = 0;
+const asyncStorageValues = new Map<string, string>();
+const asyncStorage = AsyncStorage as jest.Mocked<typeof AsyncStorage>;
 
 type NativeClipboardFile = {
   filePath: string;
@@ -488,6 +495,16 @@ beforeEach(async () => {
   controls.reset();
   nativeCopySequence = 0;
   jest.clearAllMocks();
+  asyncStorageValues.clear();
+  asyncStorage.getItem.mockReset().mockImplementation(async (key) =>
+    asyncStorageValues.get(key) ?? null
+  );
+  asyncStorage.setItem.mockReset().mockImplementation(async (key, value) => {
+    asyncStorageValues.set(key, value);
+  });
+  asyncStorage.removeItem.mockReset().mockImplementation(async (key) => {
+    asyncStorageValues.delete(key);
+  });
   mockGetFileSourceIdAsync.mockReset();
   mockSaveFileToFileAsync.mockReset();
   mockGetFileSourceIdAsync.mockResolvedValue(clipboardSourceId);
@@ -962,12 +979,137 @@ describe('clipboard file cache persistence', () => {
 
 describe('clipboard monitor deferred file persistence', () => {
   it.each(['deleted', 'unreadable'] as const)(
-    'drops a file that becomes %s between the poll and its debounced callbacks',
+    'drops a file that becomes %s, then emits the valid same-source retry',
     async (failureKind) => {
+      const { ClipboardMonitor } = require('../features/clipboard/internal/clipboardMonitor') as
+        typeof import('../features/clipboard/internal/clipboardMonitor');
+      jest.useFakeTimers({ doNotFake: ['Date'] });
+      const bytes = Buffer.from('file removed during the debounce window');
+      const copies: NativeClipboardFile[] = [];
+      mockSaveFileToFileAsync.mockImplementation(async () => {
+        const copy = nativeClipboardFile(bytes);
+        copies.push(copy);
+        return copy;
+      });
+      const monitor = new ClipboardMonitor(new ClipboardManager(), {
+        pollingInterval: 60_000,
+        debounceDelay: 300,
+        stopOnBackground: false,
+      });
+      const persistence: Promise<void>[] = [];
+      const persist = jest.fn((content: ClipboardContent) => {
+        persistence.push(
+          useHistoryStore
+            .getState()
+            .addItem(historyItemFromContent(content), { throwOnFailure: true })
+        );
+      });
+      const externalNotify = jest.fn();
+      monitor.addCallback(persist);
+      monitor.addCallback(externalNotify);
+      await monitor.start();
+
+      const check = monitor.triggerCheck();
+      await jest.advanceTimersByTimeAsync(0);
+      await check;
+      const firstUri = copies[0].filePath;
+      if (failureKind === 'deleted') {
+        rmSync(fileURLToPath(firstUri));
+      } else {
+        controls.failExists(firstUri, new Error('clipboard payload is unreadable'));
+      }
+      await jest.advanceTimersByTimeAsync(300);
+      await Promise.resolve();
+
+      expect(persist).not.toHaveBeenCalled();
+      expect(externalNotify).not.toHaveBeenCalled();
+      await expect(historyStorage.getItem(fileHash(bytes))).resolves.toBeNull();
+      expect(useHistoryStore.getState().error).toBeNull();
+
+      if (failureKind === 'unreadable') controls.restoreExists(firstUri);
+      const retry = monitor.triggerCheck();
+      await jest.advanceTimersByTimeAsync(0);
+      await retry;
+      await jest.advanceTimersByTimeAsync(300);
+      await Promise.all(persistence);
+
+      expect(persist).toHaveBeenCalledTimes(1);
+      expect(externalNotify).toHaveBeenCalledTimes(1);
+      expect(externalNotify).toHaveBeenCalledWith(persist.mock.calls[0][0]);
+      if (failureKind === 'deleted') {
+        expect(persist.mock.calls[0][0].fileUri).not.toBe(firstUri);
+        expect(mockSaveFileToFileAsync).toHaveBeenCalledTimes(2);
+      } else {
+        expect(persist.mock.calls[0][0].fileUri).toBe(firstUri);
+        expect(mockSaveFileToFileAsync).toHaveBeenCalledTimes(1);
+      }
+      const stored = await historyStorage.getItem(fileHash(bytes));
+      expect(stored?.isDeleted).toBe(false);
+      expect(readFileSync(fileURLToPath(stored!.fileUri!))).toEqual(bytes);
+      monitor.stop();
+    }
+  );
+
+  it('does not let a persisted dropped hash suppress the same file after restart', async () => {
     const { ClipboardMonitor } = require('../features/clipboard/internal/clipboardMonitor') as
       typeof import('../features/clipboard/internal/clipboardMonitor');
     jest.useFakeTimers({ doNotFake: ['Date'] });
-    const bytes = Buffer.from('file removed during the debounce window');
+    const bytes = Buffer.from('same native file after monitor restart');
+    const copies: NativeClipboardFile[] = [];
+    mockSaveFileToFileAsync.mockImplementation(async () => {
+      const copy = nativeClipboardFile(bytes);
+      copies.push(copy);
+      return copy;
+    });
+    const firstMonitor = new ClipboardMonitor(new ClipboardManager(), {
+      pollingInterval: 60_000,
+      debounceDelay: 300,
+      stopOnBackground: false,
+    });
+    await firstMonitor.start();
+    const firstCheck = firstMonitor.triggerCheck();
+    await jest.advanceTimersByTimeAsync(0);
+    await firstCheck;
+    rmSync(fileURLToPath(copies[0].filePath));
+    await jest.advanceTimersByTimeAsync(300);
+    await Promise.resolve();
+    firstMonitor.stop();
+
+    expect(asyncStorageValues.size).toBe(0);
+
+    const restartedMonitor = new ClipboardMonitor(new ClipboardManager(), {
+      pollingInterval: 60_000,
+      debounceDelay: 300,
+      stopOnBackground: false,
+    });
+    const persistence: Promise<void>[] = [];
+    const persist = jest.fn((content: ClipboardContent) => {
+      persistence.push(
+        useHistoryStore
+          .getState()
+          .addItem(historyItemFromContent(content), { throwOnFailure: true })
+      );
+    });
+    restartedMonitor.addCallback(persist);
+    await restartedMonitor.start();
+    const retry = restartedMonitor.triggerCheck();
+    await jest.advanceTimersByTimeAsync(0);
+    await retry;
+    await jest.advanceTimersByTimeAsync(300);
+    await Promise.all(persistence);
+
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(persist.mock.calls[0][0].fileUri).not.toBe(copies[0].filePath);
+    const stored = await historyStorage.getItem(fileHash(bytes));
+    expect(readFileSync(fileURLToPath(stored!.fileUri!))).toEqual(bytes);
+    restartedMonitor.stop();
+  });
+
+  it('does not clear newer clipboard state when an older deferred file is dropped', async () => {
+    const { ClipboardMonitor } = require('../features/clipboard/internal/clipboardMonitor') as
+      typeof import('../features/clipboard/internal/clipboardMonitor');
+    jest.useFakeTimers({ doNotFake: ['Date'] });
+    const bytes = Buffer.from('older deferred file');
     let copiedFile: NativeClipboardFile | null = null;
     mockSaveFileToFileAsync.mockImplementationOnce(async () => {
       copiedFile = nativeClipboardFile(bytes);
@@ -978,33 +1120,234 @@ describe('clipboard monitor deferred file persistence', () => {
       debounceDelay: 300,
       stopOnBackground: false,
     });
-    const persist = jest.fn((content: ClipboardContent) => {
-      void useHistoryStore
-        .getState()
-        .addItem(historyItemFromContent(content), { throwOnFailure: true })
-        .catch(() => undefined);
-    });
-    const externalNotify = jest.fn();
-    monitor.addCallback(persist);
-    monitor.addCallback(externalNotify);
     await monitor.start();
-
     const check = monitor.triggerCheck();
     await jest.advanceTimersByTimeAsync(0);
     await check;
-    if (failureKind === 'deleted') {
-      rmSync(fileURLToPath(copiedFile!.filePath));
-    } else {
-      controls.failExists(copiedFile!.filePath, new Error('clipboard payload is unreadable'));
-    }
+
+    const newerContent: ClipboardContent = {
+      type: 'Text',
+      text: 'newer clipboard content',
+      profileHash: 'NEWER_CONTENT',
+      localClipboardHash: 'NEWER_CONTENT',
+      timestamp: freshTime + 1,
+    };
+    await monitor.setLastContent(newerContent);
+    rmSync(fileURLToPath(copiedFile!.filePath));
+    await jest.advanceTimersByTimeAsync(300);
+    await Promise.resolve();
+    monitor.stop();
+
+    expect([...asyncStorageValues.values()]).toEqual([
+      JSON.stringify({
+        localClipboardHash: 'NEWER_CONTENT',
+        profileHash: 'NEWER_CONTENT',
+        type: 'Text',
+      }),
+    ]);
+    const restartedMonitor = new ClipboardMonitor(new ClipboardManager(), {
+      pollingInterval: 60_000,
+      debounceDelay: 300,
+      stopOnBackground: false,
+    });
+    await restartedMonitor.start();
+    await expect(restartedMonitor.checkAndUpdateLastContent(newerContent)).resolves.toBe(false);
+    restartedMonitor.stop();
+  });
+
+  it('rechecks newer clipboard state after an asynchronous history lookup', async () => {
+    const { ClipboardMonitor } = require('../features/clipboard/internal/clipboardMonitor') as
+      typeof import('../features/clipboard/internal/clipboardMonitor');
+    const bytes = Buffer.from('native temp whose lookup races a newer clipboard value');
+    let copiedFile: NativeClipboardFile | null = null;
+    mockSaveFileToFileAsync.mockImplementationOnce(async () => {
+      copiedFile = nativeClipboardFile(bytes);
+      return copiedFile;
+    });
+
+    jest.useFakeTimers({ doNotFake: ['Date'] });
+    const monitor = new ClipboardMonitor(new ClipboardManager(), {
+      pollingInterval: 60_000,
+      debounceDelay: 300,
+      stopOnBackground: false,
+    });
+    await monitor.start();
+    const check = monitor.triggerCheck();
+    await jest.advanceTimersByTimeAsync(0);
+    await check;
+    rmSync(fileURLToPath(copiedFile!.filePath));
+
+    const db = await getDatabase();
+    const originalGetFirst = db.getFirstAsync.bind(db);
+    let enterLookup!: () => void;
+    let releaseLookup!: () => void;
+    let finishLookup!: () => void;
+    const lookupEntered = new Promise<void>((resolve) => { enterLookup = resolve; });
+    const lookupWait = new Promise<void>((resolve) => { releaseLookup = resolve; });
+    const lookupFinished = new Promise<void>((resolve) => { finishLookup = resolve; });
+    jest.spyOn(db, 'getFirstAsync').mockImplementation(async (source, ...params) => {
+      enterLookup();
+      await lookupWait;
+      const result = await originalGetFirst(source, ...params);
+      finishLookup();
+      return result;
+    });
+
+    const debounce = jest.advanceTimersByTimeAsync(300);
+    await lookupEntered;
+    const newerContent: ClipboardContent = {
+      type: 'Text',
+      text: 'wins while dropped history is being classified',
+      profileHash: 'ASYNC_LOOKUP_WINNER',
+      localClipboardHash: 'ASYNC_LOOKUP_WINNER',
+      timestamp: freshTime + 2,
+    };
+    await monitor.setLastContent(newerContent);
+    releaseLookup();
+    await lookupFinished;
+    await debounce;
+    await Promise.resolve();
+
+    expect([...asyncStorageValues.values()]).toEqual([
+      JSON.stringify({
+        localClipboardHash: 'ASYNC_LOOKUP_WINNER',
+        profileHash: 'ASYNC_LOOKUP_WINNER',
+        type: 'Text',
+      }),
+    ]);
+    await expect(monitor.checkAndUpdateLastContent(newerContent)).resolves.toBe(false);
+    monitor.stop();
+  });
+
+  it('keeps an active history watermark terminal when its payload disappears', async () => {
+    const { ClipboardMonitor } = require('../features/clipboard/internal/clipboardMonitor') as
+      typeof import('../features/clipboard/internal/clipboardMonitor');
+    const bytes = Buffer.from('active history payload restored from the native provider');
+    mockSaveFileToFileAsync.mockImplementation(async () => nativeClipboardFile(bytes));
+    const manager = new ClipboardManager();
+    const nativeContent = (await manager.getClipboardContent())!;
+    const firstStored = await historyStorage.addItem(historyItemFromContent(nativeContent));
+
+    jest.useFakeTimers({ doNotFake: ['Date'] });
+    const monitor = new ClipboardMonitor(manager, {
+      pollingInterval: 60_000,
+      debounceDelay: 300,
+      stopOnBackground: false,
+    });
+    const callback = jest.fn();
+    monitor.addCallback(callback);
+    await monitor.start();
+    const check = monitor.triggerCheck();
+    await jest.advanceTimersByTimeAsync(0);
+    await check;
+    rmSync(fileURLToPath(firstStored.fileUri!));
     await jest.advanceTimersByTimeAsync(300);
     await Promise.resolve();
 
-    expect(persist).not.toHaveBeenCalled();
-    expect(externalNotify).not.toHaveBeenCalled();
-    await expect(historyStorage.getItem(fileHash(bytes))).resolves.toBeNull();
-    expect(useHistoryStore.getState().error).toBeNull();
+    expect(callback).not.toHaveBeenCalled();
+    expect((await historyStorage.getItem(firstStored.profileHash))?.isDeleted).toBe(false);
+
+    const retry = monitor.triggerCheck();
+    await jest.advanceTimersByTimeAsync(0);
+    await retry;
+    await jest.advanceTimersByTimeAsync(300);
+
+    expect(callback).not.toHaveBeenCalled();
+    expect(mockSaveFileToFileAsync).toHaveBeenCalledTimes(2);
+    await expect(historyStorage.getItem(firstStored.profileHash)).resolves.toMatchObject({
+      isDeleted: false,
+    });
+    expect(existsSync(fileURLToPath(firstStored.fileUri!))).toBe(false);
     monitor.stop();
-    }
-  );
+  });
+
+  it('keeps a tombstone terminal even when the dropped URI is a native temp file', async () => {
+    const { ClipboardMonitor } = require('../features/clipboard/internal/clipboardMonitor') as
+      typeof import('../features/clipboard/internal/clipboardMonitor');
+    const bytes = Buffer.from('temp copy whose matching history row was deleted');
+    const hash = fileHash(bytes);
+    const seeded = await historyStorage.addItem(createDefaultClipboardItem({
+      type: 'File',
+      text: 'deleted.log',
+      profileHash: hash,
+      localClipboardHash: hash,
+      hasData: true,
+      dataName: 'deleted.log',
+      size: bytes.length,
+      fileUri: sourceFile(hash, 'deleted.log', bytes),
+    }));
+    await historyStorage.softDeleteItem(seeded.profileHash);
+    const copies: NativeClipboardFile[] = [];
+    mockSaveFileToFileAsync.mockImplementation(async () => {
+      const copy = nativeClipboardFile(bytes, 'deleted.log');
+      copies.push(copy);
+      return copy;
+    });
+
+    jest.useFakeTimers({ doNotFake: ['Date'] });
+    const monitor = new ClipboardMonitor(new ClipboardManager(), {
+      pollingInterval: 60_000,
+      debounceDelay: 300,
+      stopOnBackground: false,
+    });
+    const callback = jest.fn();
+    monitor.addCallback(callback);
+    await monitor.start();
+    const check = monitor.triggerCheck();
+    await jest.advanceTimersByTimeAsync(0);
+    await check;
+    rmSync(fileURLToPath(copies[0].filePath));
+    await jest.advanceTimersByTimeAsync(300);
+    await Promise.resolve();
+
+    const retry = monitor.triggerCheck();
+    await jest.advanceTimersByTimeAsync(0);
+    await retry;
+    await jest.advanceTimersByTimeAsync(300);
+
+    expect(callback).not.toHaveBeenCalled();
+    expect(mockSaveFileToFileAsync).toHaveBeenCalledTimes(2);
+    await expect(historyStorage.getItem(hash)).resolves.toMatchObject({ isDeleted: true });
+    monitor.stop();
+  });
+
+  it('does not revive a file deleted from history during the debounce window', async () => {
+    const { ClipboardMonitor } = require('../features/clipboard/internal/clipboardMonitor') as
+      typeof import('../features/clipboard/internal/clipboardMonitor');
+    const bytes = Buffer.from('history payload deleted by the user');
+    mockSaveFileToFileAsync.mockImplementation(async () => nativeClipboardFile(bytes));
+    const manager = new ClipboardManager();
+    const nativeContent = (await manager.getClipboardContent())!;
+    const stored = await historyStorage.addItem(historyItemFromContent(nativeContent));
+    expect(readFileSync(fileURLToPath(stored.fileUri!))).toEqual(bytes);
+
+    jest.useFakeTimers({ doNotFake: ['Date'] });
+    const monitor = new ClipboardMonitor(manager, {
+      pollingInterval: 60_000,
+      debounceDelay: 300,
+      stopOnBackground: false,
+    });
+    const callback = jest.fn();
+    monitor.addCallback(callback);
+    await monitor.start();
+    const check = monitor.triggerCheck();
+    await jest.advanceTimersByTimeAsync(0);
+    await check;
+    await historyStorage.softDeleteItem(stored.profileHash);
+    await jest.advanceTimersByTimeAsync(300);
+    await Promise.resolve();
+
+    expect(callback).not.toHaveBeenCalled();
+    const retry = monitor.triggerCheck();
+    await jest.advanceTimersByTimeAsync(0);
+    await retry;
+    await jest.advanceTimersByTimeAsync(300);
+
+    expect(callback).not.toHaveBeenCalled();
+    await expect(historyStorage.getItem(stored.profileHash)).resolves.toMatchObject({
+      isDeleted: true,
+    });
+    expect(existsSync(fileURLToPath(stored.fileUri!))).toBe(false);
+    monitor.stop();
+  });
 });
